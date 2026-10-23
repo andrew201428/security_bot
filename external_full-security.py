@@ -1,79 +1,86 @@
 import os
 import time
+import random
 import sqlite3
 import asyncio
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
-from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-# ---------------- CONFIGURATION ----------------
+# ============================================================
+# EXTERNAL | FULL SECURITY
+# Multi-server Discord security and moderation bot
+# ============================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-OWNER_IDS = {
-    int(value.strip())
-    for value in os.getenv("BOT_OWNER_IDS", "").split(",")
-    if value.strip().isdigit()
-}
+# Global bot owner. Keep your owner ID here.
+OWNER_IDS = {1460495693536825479}
 
 DATABASE = "external_security.db"
 
-INTENTS = discord.Intents.default()
-INTENTS.guilds = True
-INTENTS.members = True
-INTENTS.message_content = True
-INTENTS.moderation = True
-INTENTS.invites = True
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+intents.moderation = True
+intents.invites = True
 
-bot = commands.Bot(command_prefix="!", intents=INTENTS)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-spam_messages = defaultdict(deque)
+spam_cache = defaultdict(deque)
 invite_cache = {}
-ready_once = False
+giveaway_tasks = {}
 
 
-# ---------------- DATABASE ----------------
+# ============================================================
+# DATABASE
+# ============================================================
+
+def db_connect():
+    return sqlite3.connect(DATABASE)
+
 
 def init_db():
-    with sqlite3.connect(DATABASE) as db:
+    with db_connect() as db:
         db.execute("""
-            CREATE TABLE IF NOT EXISTS guild_settings (
+            CREATE TABLE IF NOT EXISTS settings (
                 guild_id INTEGER PRIMARY KEY,
                 log_channel_id INTEGER,
-                anti_spam INTEGER DEFAULT 1,
-                anti_nuke INTEGER DEFAULT 1,
-                anti_bot INTEGER DEFAULT 1,
-                spam_action TEXT DEFAULT 'timeout',
-                spam_limit INTEGER DEFAULT 5,
-                spam_seconds INTEGER DEFAULT 5
-            )
-        """)
-
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS autoresponders (
-                guild_id INTEGER,
-                trigger TEXT,
-                response TEXT,
-                PRIMARY KEY (guild_id, trigger)
+                antispam INTEGER NOT NULL DEFAULT 1,
+                antinuke INTEGER NOT NULL DEFAULT 1,
+                antibot INTEGER NOT NULL DEFAULT 1,
+                spam_limit INTEGER NOT NULL DEFAULT 5,
+                spam_window INTEGER NOT NULL DEFAULT 5,
+                spam_action TEXT NOT NULL DEFAULT 'timeout'
             )
         """)
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS authorized_members (
-                guild_id INTEGER,
-                user_id INTEGER,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS trusted_bots (
-                guild_id INTEGER,
-                bot_id INTEGER,
+                guild_id INTEGER NOT NULL,
+                bot_id INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, bot_id)
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS autoresponders (
+                guild_id INTEGER NOT NULL,
+                trigger TEXT NOT NULL,
+                response TEXT NOT NULL,
+                PRIMARY KEY (guild_id, trigger)
             )
         """)
 
@@ -81,112 +88,106 @@ def init_db():
 
 
 def get_settings(guild_id):
-    with sqlite3.connect(DATABASE) as db:
+    with db_connect() as db:
         row = db.execute(
-            "SELECT log_channel_id, anti_spam, anti_nuke, anti_bot, "
-            "spam_action, spam_limit, spam_seconds "
-            "FROM guild_settings WHERE guild_id = ?",
+            "SELECT log_channel_id, antispam, antinuke, antibot, "
+            "spam_limit, spam_window, spam_action "
+            "FROM settings WHERE guild_id = ?",
             (guild_id,)
         ).fetchone()
 
         if row is None:
             db.execute(
-                "INSERT INTO guild_settings (guild_id) VALUES (?)",
+                "INSERT OR IGNORE INTO settings (guild_id) VALUES (?)",
                 (guild_id,)
             )
             db.commit()
-
             return {
                 "log_channel_id": None,
-                "anti_spam": 1,
-                "anti_nuke": 1,
-                "anti_bot": 1,
-                "spam_action": "timeout",
+                "antispam": True,
+                "antinuke": True,
+                "antibot": True,
                 "spam_limit": 5,
-                "spam_seconds": 5
+                "spam_window": 5,
+                "spam_action": "timeout"
             }
 
     return {
         "log_channel_id": row[0],
-        "anti_spam": row[1],
-        "anti_nuke": row[2],
-        "anti_bot": row[3],
-        "spam_action": row[4],
-        "spam_limit": row[5],
-        "spam_seconds": row[6]
+        "antispam": bool(row[1]),
+        "antinuke": bool(row[2]),
+        "antibot": bool(row[3]),
+        "spam_limit": row[4],
+        "spam_window": row[5],
+        "spam_action": row[6]
     }
 
 
-def update_setting(guild_id, setting, value):
+def set_setting(guild_id, name, value):
     allowed = {
-        "log_channel_id",
-        "anti_spam",
-        "anti_nuke",
-        "anti_bot",
-        "spam_action",
-        "spam_limit",
-        "spam_seconds"
+        "log_channel_id", "antispam", "antinuke", "antibot",
+        "spam_limit", "spam_window", "spam_action"
     }
-
-    if setting not in allowed:
-        raise ValueError("Invalid setting.")
+    if name not in allowed:
+        raise ValueError("Invalid setting")
 
     get_settings(guild_id)
 
-    with sqlite3.connect(DATABASE) as db:
+    with db_connect() as db:
         db.execute(
-            f"UPDATE guild_settings SET {setting} = ? WHERE guild_id = ?",
+            f"UPDATE settings SET {name} = ? WHERE guild_id = ?",
             (value, guild_id)
         )
         db.commit()
 
 
+def is_owner(user_id):
+    return user_id in OWNER_IDS
+
+
 def is_authorized(guild_id, user_id):
-    if user_id in OWNER_IDS:
+    if is_owner(user_id):
         return True
 
-    with sqlite3.connect(DATABASE) as db:
-        result = db.execute(
+    with db_connect() as db:
+        row = db.execute(
             "SELECT 1 FROM authorized_members "
             "WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id)
         ).fetchone()
 
-    return result is not None
+    return row is not None
 
 
 def is_trusted_bot(guild_id, bot_id):
-    with sqlite3.connect(DATABASE) as db:
-        result = db.execute(
+    with db_connect() as db:
+        row = db.execute(
             "SELECT 1 FROM trusted_bots WHERE guild_id = ? AND bot_id = ?",
             (guild_id, bot_id)
         ).fetchone()
 
-    return result is not None
+    return row is not None
 
 
-# ---------------- LOGGING ----------------
+# ============================================================
+# EMBEDS AND CENTRAL LOGGING
+# ============================================================
 
-def safe_text(value, limit=1000):
+def text_or_unknown(value, limit=900):
     if value is None:
-        return "(unavailable)"
-
+        return "Unknown"
     value = str(value)
-
-    if not value.strip():
-        return "(empty)"
-
-    return value[:limit]
+    return value[:limit] if value else "(empty)"
 
 
-def make_embed(title, description, color=discord.Color.blurple()):
+def create_embed(title, description, color=None):
     embed = discord.Embed(
         title=title,
-        description=description,
-        color=color,
+        description=description[:4000],
+        color=color or discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc)
     )
-    embed.set_footer(text="EXTERNAL FULL SECURITY")
+    embed.set_footer(text="EXTERNAL | FULL SECURITY")
     return embed
 
 
@@ -194,114 +195,104 @@ async def send_log(guild, title, description, color=None, jump_url=None):
     if guild is None:
         return
 
-    settings = get_settings(guild.id)
-    channel_id = settings["log_channel_id"]
-
+    channel_id = get_settings(guild.id)["log_channel_id"]
     if not channel_id:
         return
 
     channel = guild.get_channel(channel_id)
-
     if channel is None:
         try:
             channel = await guild.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        except (discord.HTTPException, discord.Forbidden):
             return
 
     if not isinstance(channel, discord.TextChannel):
         return
 
-    embed = make_embed(
-        title,
-        description,
-        color or discord.Color.blurple()
-    )
+    embed = create_embed(title, description, color)
 
     if jump_url:
         embed.add_field(
-            name="Message Location",
-            value=f"[Open message location]({jump_url})",
+            name="Message link",
+            value=f"[Open message]({jump_url})",
             inline=False
         )
 
     try:
-        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
     except discord.HTTPException:
         pass
 
 
-async def find_audit_actor(guild, action, target_id=None):
-    """Best-effort audit-log lookup. The result is not guaranteed."""
+async def audit_actor(guild, action, target_id=None):
+    """Best-effort lookup; Discord may not identify the actor."""
     try:
         async for entry in guild.audit_logs(limit=8, action=action):
             if target_id is not None:
-                entry_target = getattr(entry.target, "id", None)
-                if entry_target != target_id:
+                if getattr(entry.target, "id", None) != target_id:
                     continue
 
             age = (discord.utils.utcnow() - entry.created_at).total_seconds()
-
-            if age <= 15:
+            if 0 <= age <= 15:
                 return entry.user, entry.reason
-
     except (discord.Forbidden, discord.HTTPException):
         pass
 
     return None, None
 
 
-# ---------------- INVITE TRACKING ----------------
+# ============================================================
+# BOT STARTUP AND INVITES
+# ============================================================
 
-async def refresh_invites(guild):
+async def update_invite_cache(guild):
     try:
         invites = await guild.invites()
         invite_cache[guild.id] = {
-            invite.code: {
-                "uses": invite.uses or 0,
-                "inviter_id": invite.inviter.id if invite.inviter else None,
-                "channel_id": invite.channel.id if invite.channel else None
+            inv.code: {
+                "uses": inv.uses or 0,
+                "inviter_id": inv.inviter.id if inv.inviter else None,
+                "channel_id": inv.channel.id if inv.channel else None
             }
-            for invite in invites
+            for inv in invites
         }
     except (discord.Forbidden, discord.HTTPException):
         invite_cache[guild.id] = {}
 
 
 @bot.event
-async def on_ready():
-    global ready_once
-
+async def setup_hook():
     init_db()
+    try:
+        synced = await bot.tree.sync()
+        print(f"Registered {len(synced)} slash commands.")
+    except discord.HTTPException as exc:
+        print(f"Slash command sync failed: {exc}")
 
-    if not ready_once:
-        try:
-            synced = await bot.tree.sync()
-            print(f"Synced {len(synced)} global slash commands.")
-        except discord.HTTPException as error:
-            print(f"Command sync failed: {error}")
 
-        ready_once = True
-
-    for guild in bot.guilds:
-        await refresh_invites(guild)
-
+@bot.event
+async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
+    for guild in bot.guilds:
+        await update_invite_cache(guild)
 
 
 @bot.event
 async def on_guild_join(guild):
-    await refresh_invites(guild)
+    await update_invite_cache(guild)
 
 
 @bot.event
 async def on_invite_create(invite):
-    await refresh_invites(invite.guild)
-
+    await update_invite_cache(invite.guild)
     await send_log(
         invite.guild,
         "Invite Created",
         f"Code: `{invite.code}`\n"
-        f"Created by: {invite.inviter or 'Unknown'}\n"
+        f"Creator: {invite.inviter or 'Unknown'}\n"
         f"Channel: {invite.channel or 'Unknown'}"
     )
 
@@ -314,23 +305,22 @@ async def on_invite_delete(invite):
         f"Code: `{invite.code}`\n"
         f"Channel: {invite.channel or 'Unknown'}"
     )
+    await update_invite_cache(invite.guild)
 
-    await refresh_invites(invite.guild)
 
-
-# ---------------- MESSAGE LOGGING ----------------
-# Normal messages are NOT logged.
-# Only edited and deleted messages are logged.
+# ============================================================
+# MESSAGE EDIT AND DELETE LOGS
+# Normal messages are not logged.
+# ============================================================
 
 @bot.event
 async def on_message_edit(before, after):
     if before.guild is None or before.author.bot:
         return
-
     if before.content == after.content:
         return
 
-    jump_url = (
+    url = (
         f"https://discord.com/channels/"
         f"{before.guild.id}/{before.channel.id}/{before.id}"
     )
@@ -338,11 +328,11 @@ async def on_message_edit(before, after):
     await send_log(
         before.guild,
         "Message Edited",
-        f"Member: {before.author} (`{before.author.id}`)\n"
+        f"Author: {before.author} (`{before.author.id}`)\n"
         f"Channel: {before.channel.mention}\n\n"
-        f"Before:\n{safe_text(before.content)}\n\n"
-        f"After:\n{safe_text(after.content)}",
-        jump_url=jump_url
+        f"Before:\n{text_or_unknown(before.content)}\n\n"
+        f"After:\n{text_or_unknown(after.content)}",
+        jump_url=url
     )
 
 
@@ -351,15 +341,15 @@ async def on_message_delete(message):
     if message.guild is None or message.author.bot:
         return
 
-    jump_url = (
-        f"https://discord.com/channels/"
-        f"{message.guild.id}/{message.channel.id}/{message.id}"
-    )
-
-    actor, reason = await find_audit_actor(
+    actor, reason = await audit_actor(
         message.guild,
         discord.AuditLogAction.message_delete,
         message.author.id
+    )
+
+    url = (
+        f"https://discord.com/channels/"
+        f"{message.guild.id}/{message.channel.id}/{message.id}"
     )
 
     await send_log(
@@ -368,14 +358,16 @@ async def on_message_delete(message):
         f"Original author: {message.author} (`{message.author.id}`)\n"
         f"Channel: {message.channel.mention}\n"
         f"Deleted by: {actor or 'Unknown'}\n"
-        f"Reason: {safe_text(reason)}\n\n"
-        f"Content:\n{safe_text(message.content)}",
-        color=discord.Color.red(),
-        jump_url=jump_url
+        f"Reason: {text_or_unknown(reason)}\n\n"
+        f"Cached content:\n{text_or_unknown(message.content)}",
+        discord.Color.red(),
+        jump_url=url
     )
 
 
-# ---------------- MEMBER LOGGING ----------------
+# ============================================================
+# MEMBER, ROLE, AND BOT LOGS
+# ============================================================
 
 @bot.event
 async def on_member_join(member):
@@ -389,88 +381,77 @@ async def on_member_join(member):
     if not member.bot:
         return
 
-    settings = get_settings(member.guild.id)
-
-    actor, reason = await find_audit_actor(
-        member.guild,
-        discord.AuditLogAction.bot_add,
-        member.id
+    actor, reason = await audit_actor(
+        member.guild, discord.AuditLogAction.bot_add, member.id
     )
 
-    old_invites = invite_cache.get(member.guild.id, {})
-    await refresh_invites(member.guild)
-    new_invites = invite_cache.get(member.guild.id, {})
+    old = invite_cache.get(member.guild.id, {})
+    await update_invite_cache(member.guild)
+    new = invite_cache.get(member.guild.id, {})
 
-    used_invite = None
-
-    for code, data in new_invites.items():
-        old_uses = old_invites.get(code, {}).get("uses", 0)
-        if data["uses"] > old_uses:
-            used_invite = data
+    used = None
+    for code, data in new.items():
+        previous_uses = old.get(code, {}).get("uses", 0)
+        if data["uses"] > previous_uses:
+            used = data
             break
 
-    inviter_text = str(actor) if actor else "Unknown"
-    channel_text = "Unknown"
+    inviter = str(actor) if actor else "Unknown"
+    invite_channel = "Unknown"
 
-    if used_invite:
-        inviter_text = (
-            f"<@{used_invite['inviter_id']}>"
-            if used_invite["inviter_id"]
-            else inviter_text
-        )
-
-        if used_invite["channel_id"]:
-            channel = member.guild.get_channel(used_invite["channel_id"])
-            if channel:
-                channel_text = channel.mention
+    if used:
+        if used["inviter_id"]:
+            inviter = f"<@{used['inviter_id']}>"
+        if used["channel_id"]:
+            ch = member.guild.get_channel(used["channel_id"])
+            if ch:
+                invite_channel = ch.mention
 
     await send_log(
         member.guild,
         "Bot Joined",
         f"Bot: {member} (`{member.id}`)\n"
-        f"Invited by: {inviter_text}\n"
-        f"Invite channel: {channel_text}\n"
-        f"Audit-log reason: {safe_text(reason)}"
+        f"Inviter: {inviter}\n"
+        f"Invite channel: {invite_channel}\n"
+        f"Audit reason: {text_or_unknown(reason)}"
     )
 
-    if settings["anti_bot"] and not is_trusted_bot(member.guild.id, member.id):
+    settings = get_settings(member.guild.id)
+    if settings["antibot"] and not is_trusted_bot(member.guild.id, member.id):
         await send_log(
             member.guild,
             "Untrusted Bot Alert",
             f"Bot: {member} (`{member.id}`)\n"
-            f"Invited by: {inviter_text}\n"
-            "This bot is not on the server's trusted-bot list.",
-            color=discord.Color.orange()
+            f"Inviter: {inviter}\n"
+            "This bot is not on the trusted-bot list.",
+            discord.Color.orange()
         )
 
 
 @bot.event
 async def on_member_remove(member):
-    actor, reason = await find_audit_actor(
-        member.guild,
-        discord.AuditLogAction.kick,
-        member.id
+    actor, reason = await audit_actor(
+        member.guild, discord.AuditLogAction.kick, member.id
     )
-
     await send_log(
         member.guild,
         "Member Left or Was Removed",
         f"Member: {member} (`{member.id}`)\n"
         f"Possible kick executor: {actor or 'Unknown'}\n"
-        f"Reason: {safe_text(reason)}"
+        f"Reason: {text_or_unknown(reason)}"
     )
 
 
 @bot.event
 async def on_member_update(before, after):
-    old_roles = {role.id: role for role in before.roles}
-    new_roles = {role.id: role for role in after.roles}
+    old_roles = {r.id: r for r in before.roles}
+    new_roles = {r.id: r for r in after.roles}
 
     added = [r for rid, r in new_roles.items() if rid not in old_roles]
     removed = [r for rid, r in old_roles.items() if rid not in new_roles]
 
     if added or removed:
-        actor, reason = await find_audit_actor(
+        actor, reason = await audit_actor(
             after.guild,
             discord.AuditLogAction.member_role_update,
             after.id
@@ -481,9 +462,9 @@ async def on_member_update(before, after):
                 after.guild,
                 "Member Role Added",
                 f"Member: {after} (`{after.id}`)\n"
-                f"Role(s): {', '.join(r.name for r in added)}\n"
+                f"Roles: {', '.join(r.name for r in added)}\n"
                 f"Changed by: {actor or 'Unknown'}\n"
-                f"Reason: {safe_text(reason)}"
+                f"Reason: {text_or_unknown(reason)}"
             )
 
         if removed:
@@ -491,9 +472,9 @@ async def on_member_update(before, after):
                 after.guild,
                 "Member Role Removed",
                 f"Member: {after} (`{after.id}`)\n"
-                f"Role(s): {', '.join(r.name for r in removed)}\n"
+                f"Roles: {', '.join(r.name for r in removed)}\n"
                 f"Changed by: {actor or 'Unknown'}\n"
-                f"Reason: {safe_text(reason)}"
+                f"Reason: {text_or_unknown(reason)}"
             )
 
     if before.nick != after.nick:
@@ -501,67 +482,58 @@ async def on_member_update(before, after):
             after.guild,
             "Nickname Changed",
             f"Member: {after} (`{after.id}`)\n"
-            f"Before: {safe_text(before.nick)}\n"
-            f"After: {safe_text(after.nick)}"
+            f"Before: {text_or_unknown(before.nick)}\n"
+            f"After: {text_or_unknown(after.nick)}"
         )
 
     if before.timed_out_until != after.timed_out_until:
         await send_log(
             after.guild,
-            "Member Timeout Updated",
+            "Timeout Updated",
             f"Member: {after} (`{after.id}`)\n"
-            f"Before: {safe_text(before.timed_out_until)}\n"
-            f"After: {safe_text(after.timed_out_until)}"
+            f"Before: {text_or_unknown(before.timed_out_until)}\n"
+            f"After: {text_or_unknown(after.timed_out_until)}"
         )
 
 
-# ---------------- ROLE LOGGING ----------------
+# ============================================================
+# ROLE AND CHANNEL LOGS
+# ============================================================
 
 @bot.event
 async def on_guild_role_create(role):
-    actor, reason = await find_audit_actor(
-        role.guild,
-        discord.AuditLogAction.role_create,
-        role.id
+    actor, reason = await audit_actor(
+        role.guild, discord.AuditLogAction.role_create, role.id
     )
-
     await send_log(
-        role.guild,
-        "Role Created",
+        role.guild, "Role Created",
         f"Role: {role.name} (`{role.id}`)\n"
-        f"Created by: {actor or 'Unknown'}\n"
-        f"Reason: {safe_text(reason)}"
+        f"By: {actor or 'Unknown'}\nReason: {text_or_unknown(reason)}"
     )
 
 
 @bot.event
 async def on_guild_role_delete(role):
-    actor, reason = await find_audit_actor(
-        role.guild,
-        discord.AuditLogAction.role_delete,
-        role.id
+    actor, reason = await audit_actor(
+        role.guild, discord.AuditLogAction.role_delete, role.id
     )
-
     await send_log(
-        role.guild,
-        "Role Deleted",
+        role.guild, "Role Deleted",
         f"Role: {role.name} (`{role.id}`)\n"
-        f"Deleted by: {actor or 'Unknown'}\n"
-        f"Reason: {safe_text(reason)}",
-        color=discord.Color.red()
+        f"By: {actor or 'Unknown'}\nReason: {text_or_unknown(reason)}",
+        discord.Color.red()
     )
 
 
 @bot.event
 async def on_guild_role_update(before, after):
     changes = []
-
     for label, old, new in [
         ("Name", before.name, after.name),
         ("Colour", str(before.colour), str(after.colour)),
         ("Hoist", before.hoist, after.hoist),
         ("Mentionable", before.mentionable, after.mentionable),
-        ("Permissions", str(before.permissions.value), str(after.permissions.value))
+        ("Permissions", before.permissions.value, after.permissions.value)
     ]:
         if old != new:
             changes.append(f"{label}: `{old}` -> `{new}`")
@@ -569,63 +541,46 @@ async def on_guild_role_update(before, after):
     if not changes:
         return
 
-    actor, reason = await find_audit_actor(
-        after.guild,
-        discord.AuditLogAction.role_update,
-        after.id
+    actor, reason = await audit_actor(
+        after.guild, discord.AuditLogAction.role_update, after.id
     )
-
     await send_log(
-        after.guild,
-        "Role Updated",
+        after.guild, "Role Updated",
         f"Role: {after.name} (`{after.id}`)\n"
-        f"Changed by: {actor or 'Unknown'}\n"
-        f"{chr(10).join(changes)}\n"
-        f"Reason: {safe_text(reason)}"
+        f"By: {actor or 'Unknown'}\n"
+        + "\n".join(changes)
+        + f"\nReason: {text_or_unknown(reason)}"
     )
 
-
-# ---------------- CHANNEL LOGGING ----------------
 
 @bot.event
 async def on_guild_channel_create(channel):
-    actor, reason = await find_audit_actor(
-        channel.guild,
-        discord.AuditLogAction.channel_create,
-        channel.id
+    actor, reason = await audit_actor(
+        channel.guild, discord.AuditLogAction.channel_create, channel.id
     )
-
     await send_log(
-        channel.guild,
-        "Channel Created",
+        channel.guild, "Channel Created",
         f"Channel: {channel.name} (`{channel.id}`)\n"
-        f"Created by: {actor or 'Unknown'}\n"
-        f"Reason: {safe_text(reason)}"
+        f"By: {actor or 'Unknown'}\nReason: {text_or_unknown(reason)}"
     )
 
 
 @bot.event
 async def on_guild_channel_delete(channel):
-    actor, reason = await find_audit_actor(
-        channel.guild,
-        discord.AuditLogAction.channel_delete,
-        channel.id
+    actor, reason = await audit_actor(
+        channel.guild, discord.AuditLogAction.channel_delete, channel.id
     )
-
     await send_log(
-        channel.guild,
-        "Channel Deleted",
+        channel.guild, "Channel Deleted",
         f"Channel: {channel.name} (`{channel.id}`)\n"
-        f"Deleted by: {actor or 'Unknown'}\n"
-        f"Reason: {safe_text(reason)}",
-        color=discord.Color.red()
+        f"By: {actor or 'Unknown'}\nReason: {text_or_unknown(reason)}",
+        discord.Color.red()
     )
 
 
 @bot.event
 async def on_guild_channel_update(before, after):
     changes = []
-
     for label, old, new in [
         ("Name", before.name, after.name),
         ("Category", getattr(before.category, "name", None),
@@ -638,34 +593,32 @@ async def on_guild_channel_update(before, after):
     ]:
         if old != new:
             changes.append(
-                f"{label}: `{safe_text(old, 300)}` -> `{safe_text(new, 300)}`"
+                f"{label}: `{text_or_unknown(old, 250)}` -> "
+                f"`{text_or_unknown(new, 250)}`"
             )
 
     if not changes:
         return
 
-    actor, reason = await find_audit_actor(
-        after.guild,
-        discord.AuditLogAction.channel_update,
-        after.id
+    actor, reason = await audit_actor(
+        after.guild, discord.AuditLogAction.channel_update, after.id
     )
-
     await send_log(
-        after.guild,
-        "Channel Updated",
+        after.guild, "Channel Updated",
         f"Channel: {after.name} (`{after.id}`)\n"
-        f"Changed by: {actor or 'Unknown'}\n"
-        f"{chr(10).join(changes)}\n"
-        f"Reason: {safe_text(reason)}"
+        f"By: {actor or 'Unknown'}\n"
+        + "\n".join(changes)
+        + f"\nReason: {text_or_unknown(reason)}"
     )
 
 
-# ---------------- SERVER LOGGING ----------------
+# ============================================================
+# SERVER SETTINGS / BASIC ANTI-NUKE MONITORING
+# ============================================================
 
 @bot.event
 async def on_guild_update(before, after):
     changes = []
-
     for label, old, new in [
         ("Server name", before.name, after.name),
         ("Verification level", str(before.verification_level),
@@ -679,22 +632,23 @@ async def on_guild_update(before, after):
     if not changes:
         return
 
-    actor, reason = await find_audit_actor(
-        after,
-        discord.AuditLogAction.guild_update
+    actor, reason = await audit_actor(
+        after, discord.AuditLogAction.guild_update
     )
+    settings = get_settings(after.id)
 
     await send_log(
-        after,
-        "Server Settings Updated",
+        after, "Server Settings Updated",
         f"Changed by: {actor or 'Unknown'}\n"
-        f"{chr(10).join(changes)}\n"
-        f"Reason: {safe_text(reason)}",
-        color=discord.Color.orange()
+        + "\n".join(changes)
+        + f"\nReason: {text_or_unknown(reason)}",
+        discord.Color.orange() if settings["antinuke"] else discord.Color.blurple()
     )
 
 
-# ---------------- ANTI-SPAM ----------------
+# ============================================================
+# ANTI-SPAM AND AUTORESPONDER
+# ============================================================
 
 @bot.event
 async def on_message(message):
@@ -703,15 +657,15 @@ async def on_message(message):
 
     settings = get_settings(message.guild.id)
 
-    if settings["anti_spam"] and not is_authorized(
+    if settings["antispam"] and not is_authorized(
         message.guild.id, message.author.id
     ):
         key = (message.guild.id, message.author.id)
         now = time.monotonic()
-        queue = spam_messages[key]
+        queue = spam_cache[key]
         queue.append(now)
 
-        while queue and now - queue[0] > settings["spam_seconds"]:
+        while queue and now - queue[0] > settings["spam_window"]:
             queue.popleft()
 
         if len(queue) >= settings["spam_limit"]:
@@ -722,45 +676,39 @@ async def on_message(message):
                     limit=settings["spam_limit"],
                     check=lambda m: m.author.id == message.author.id
                 )
-            except discord.Forbidden:
+            except (discord.Forbidden, discord.HTTPException):
                 pass
-            except discord.HTTPException:
-                pass
-
-            action = settings["spam_action"]
 
             try:
+                action = settings["spam_action"]
                 if action == "kick":
                     await message.author.kick(reason="Automatic anti-spam")
                 elif action == "ban":
                     await message.author.ban(reason="Automatic anti-spam")
                 else:
                     await message.author.timeout(
-                        discord.utils.utcnow() + discord.timedelta(minutes=1),
+                        timedelta(minutes=1),
                         reason="Automatic anti-spam"
                     )
-            except (discord.Forbidden, discord.HTTPException, AttributeError):
+            except (discord.Forbidden, discord.HTTPException):
                 pass
 
             await send_log(
-                message.guild,
-                "Anti-Spam Triggered",
+                message.guild, "Anti-Spam Triggered",
                 f"Member: {message.author} (`{message.author.id}`)\n"
                 f"Channel: {message.channel.mention}\n"
-                f"Configured action: {action}"
+                f"Configured action: {settings['spam_action']}"
             )
 
-    # Match autoresponders; normal chat messages are never sent to logs.
-    with sqlite3.connect(DATABASE) as db:
-        responses = db.execute(
+    with db_connect() as db:
+        responders = db.execute(
             "SELECT trigger, response FROM autoresponders WHERE guild_id = ?",
             (message.guild.id,)
         ).fetchall()
 
     content = message.content.casefold()
-
-    for trigger, response in responses:
-        if trigger.casefold() in content:
+    for trigger, response in responders:
+        if trigger in content:
             await message.channel.send(
                 response,
                 allowed_mentions=discord.AllowedMentions.none()
@@ -770,204 +718,232 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
-# ---------------- SLASH COMMANDS ----------------
+# ============================================================
+# COMMAND PERMISSION HELPER
+# ============================================================
+
+def manage_guild_only():
+    return app_commands.checks.has_permissions(manage_guild=True)
+
+
+# ============================================================
+# LOG CHANNEL AND HELP
+# ============================================================
 
 @bot.tree.command(
     name="all-logs-channel",
-    description="Set the channel for server activity and security logs."
+    description="Set the central channel for server logs."
 )
-@app_commands.describe(channel="The channel where logs should be sent.")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(channel="The channel where activity logs will be sent.")
+@manage_guild_only()
 async def all_logs_channel(
     interaction: discord.Interaction,
     channel: discord.TextChannel
 ):
-    update_setting(interaction.guild_id, "log_channel_id", channel.id)
-
+    set_setting(interaction.guild_id, "log_channel_id", channel.id)
     await interaction.response.send_message(
-        f"All activity and security logs will be sent to {channel.mention}.",
+        f"Central logging channel set to {channel.mention}.",
         ephemeral=True
     )
-
     await send_log(
-        interaction.guild,
-        "Logging Configured",
-        f"Log channel set to {channel.mention} by {interaction.user}."
+        interaction.guild, "Logging Configured",
+        f"Set by: {interaction.user}\nChannel: {channel.mention}"
     )
 
 
-@bot.tree.command(name="help", description="Show bot commands.")
+@bot.tree.command(name="help", description="Show available bot commands.")
 async def help_command(interaction: discord.Interaction):
-    text = (
+    await interaction.response.send_message(
         "**Logging**\n"
-        "`/all-logs-channel channel:` Set the central log channel.\n\n"
+        "`/all-logs-channel channel:` Set central log channel.\n\n"
         "**Moderation**\n"
         "`/kick member reason:` Kick a member.\n"
         "`/ban member reason:` Ban a member.\n"
-        "`/addmembersrole member role:` Add a role to a member.\n\n"
+        "`/addmembersrole member role:` Add a role.\n\n"
         "**Security**\n"
-        "`/security-settings` View current security settings.\n"
-        "`/set-antispam enabled:` Enable or disable anti-spam.\n"
-        "`/set-antinuke enabled:` Enable or disable anti-nuke monitoring.\n"
-        "`/set-antibot enabled:` Enable or disable untrusted-bot alerts.\n"
-        "`/set-spam-action action:` Choose timeout, kick, or ban.\n"
-        "`/authorize-member member:` Allow a member to bypass anti-spam.\n"
-        "`/trust-bot bot:` Add a bot to the trusted-bot list.\n\n"
-        "**Utilities**\n"
+        "`/antinuke enabled:` Toggle server-change monitoring.\n"
+        "`/antispam enabled:` Toggle anti-spam.\n"
+        "`/antibot enabled:` Toggle untrusted-bot alerts.\n"
+        "`/spam-action action:` Set spam punishment.\n"
+        "`/authorize-member member:` Allow spam bypass.\n"
+        "`/trust-bot bot_member:` Trust a bot.\n"
+        "`/security-settings:` View settings.\n\n"
+        "**Other**\n"
         "`/announcement channel message:` Send an announcement.\n"
-        "`/autoresponder-add trigger response:` Add an automatic response.\n"
-        "`/autoresponder-remove trigger:` Remove an automatic response.\n"
-        "`/giveaway channel minutes prize:` Start a simple giveaway."
+        "`/autoresponder-add trigger response:` Add a responder.\n"
+        "`/autoresponder-remove trigger:` Remove a responder.\n"
+        "`/giveaway channel minutes prize:` Start a giveaway.",
+        ephemeral=True
     )
 
-    await interaction.response.send_message(text, ephemeral=True)
 
+# ============================================================
+# MODERATION COMMANDS
+# ============================================================
 
-@bot.tree.command(name="kick", description="Kick a member.")
+@bot.tree.command(name="kick", description="Kick a server member.")
 @app_commands.checks.has_permissions(kick_members=True)
 async def kick(
     interaction: discord.Interaction,
     member: discord.Member,
     reason: str = "No reason provided"
 ):
-    if member.top_role >= interaction.user.top_role and interaction.user.id not in OWNER_IDS:
+    if member.id == interaction.user.id:
         await interaction.response.send_message(
-            "You cannot kick a member with an equal or higher role.",
-            ephemeral=True
+            "You cannot kick yourself.", ephemeral=True
+        )
+        return
+
+    if member.top_role >= interaction.user.top_role and not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "The target has an equal or higher role.", ephemeral=True
         )
         return
 
     await member.kick(reason=reason)
     await interaction.response.send_message(
-        f"Kicked {member}. Reason: {reason}",
-        ephemeral=True
+        f"Kicked {member}.", ephemeral=True
     )
-
     await send_log(
-        interaction.guild,
-        "Member Kicked",
+        interaction.guild, "Member Kicked",
         f"Member: {member} (`{member.id}`)\n"
         f"By: {interaction.user}\nReason: {reason}"
     )
 
 
-@bot.tree.command(name="ban", description="Ban a member.")
+@bot.tree.command(name="ban", description="Ban a server member.")
 @app_commands.checks.has_permissions(ban_members=True)
 async def ban(
     interaction: discord.Interaction,
     member: discord.Member,
     reason: str = "No reason provided"
 ):
-    if member.top_role >= interaction.user.top_role and interaction.user.id not in OWNER_IDS:
+    if member.id == interaction.user.id:
         await interaction.response.send_message(
-            "You cannot ban a member with an equal or higher role.",
-            ephemeral=True
+            "You cannot ban yourself.", ephemeral=True
+        )
+        return
+
+    if member.top_role >= interaction.user.top_role and not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "The target has an equal or higher role.", ephemeral=True
         )
         return
 
     await member.ban(reason=reason)
     await interaction.response.send_message(
-        f"Banned {member}. Reason: {reason}",
-        ephemeral=True
+        f"Banned {member}.", ephemeral=True
     )
-
     await send_log(
-        interaction.guild,
-        "Member Banned",
+        interaction.guild, "Member Banned",
         f"Member: {member} (`{member.id}`)\n"
-        f"By: {interaction.user}\nReason: {reason}"
+        f"By: {interaction.user}\nReason: {reason}",
+        discord.Color.red()
     )
 
 
-@bot.tree.command(name="addmembersrole", description="Add a role to a member.")
+@bot.tree.command(
+    name="addmembersrole",
+    description="Add a role to a member."
+)
 @app_commands.checks.has_permissions(manage_roles=True)
 async def addmembersrole(
     interaction: discord.Interaction,
     member: discord.Member,
     role: discord.Role
 ):
-    if role >= interaction.guild.me.top_role:
+    bot_member = interaction.guild.me
+
+    if role >= bot_member.top_role:
         await interaction.response.send_message(
-            "That role is above the bot's highest role.",
+            "That role is above or equal to the bot's highest role.",
+            ephemeral=True
+        )
+        return
+
+    if role >= interaction.user.top_role and not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "That role is above or equal to your highest role.",
             ephemeral=True
         )
         return
 
     await member.add_roles(role, reason=f"Requested by {interaction.user}")
     await interaction.response.send_message(
-        f"Added role {role.name} to {member}.",
-        ephemeral=True
+        f"Added {role.name} to {member}.", ephemeral=True
     )
-
     await send_log(
-        interaction.guild,
-        "Role Added by Command",
+        interaction.guild, "Role Added by Command",
         f"Member: {member}\nRole: {role.name}\nBy: {interaction.user}"
     )
 
 
-# ---------------- SECURITY SETTINGS ----------------
+# ============================================================
+# SECURITY TOGGLES
+# ============================================================
 
-@bot.tree.command(
-    name="security-settings",
-    description="View this server's security configuration."
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def security_settings(interaction: discord.Interaction):
-    s = get_settings(interaction.guild_id)
-
+async def toggle_setting(interaction, name, enabled):
+    set_setting(interaction.guild_id, name, int(enabled))
     await interaction.response.send_message(
-        f"Log channel ID: {s['log_channel_id']}\n"
-        f"Anti-spam: {'ON' if s['anti_spam'] else 'OFF'}\n"
-        f"Anti-nuke monitoring: {'ON' if s['anti_nuke'] else 'OFF'}\n"
-        f"Anti-bot alerts: {'ON' if s['anti_bot'] else 'OFF'}\n"
-        f"Spam action: {s['spam_action']}\n"
-        f"Spam threshold: {s['spam_limit']} messages / {s['spam_seconds']} seconds",
+        f"{name.title()} is now {'enabled' if enabled else 'disabled'}.",
         ephemeral=True
     )
 
 
-async def set_boolean_setting(interaction, setting, enabled):
-    update_setting(interaction.guild_id, setting, int(enabled))
-    await interaction.response.send_message(
-        f"{setting.replace('_', ' ').title()} is now "
-        f"{'enabled' if enabled else 'disabled'}.",
-        ephemeral=True
-    )
+@bot.tree.command(name="antinuke", description="Toggle basic anti-nuke monitoring.")
+@manage_guild_only()
+async def antinuke(interaction: discord.Interaction, enabled: bool):
+    await toggle_setting(interaction, "antinuke", enabled)
 
 
-@bot.tree.command(name="set-antispam", description="Toggle anti-spam.")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def set_antispam(interaction: discord.Interaction, enabled: bool):
-    await set_boolean_setting(interaction, "anti_spam", enabled)
+@bot.tree.command(name="antispam", description="Toggle anti-spam protection.")
+@manage_guild_only()
+async def antispam(interaction: discord.Interaction, enabled: bool):
+    await toggle_setting(interaction, "antispam", enabled)
 
 
-@bot.tree.command(name="set-antinuke", description="Toggle anti-nuke monitoring.")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def set_antinuke(interaction: discord.Interaction, enabled: bool):
-    await set_boolean_setting(interaction, "anti_nuke", enabled)
+@bot.tree.command(name="antibot", description="Toggle untrusted-bot alerts.")
+@manage_guild_only()
+async def antibot(interaction: discord.Interaction, enabled: bool):
+    await toggle_setting(interaction, "antibot", enabled)
 
 
-@bot.tree.command(name="set-antibot", description="Toggle untrusted-bot alerts.")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def set_antibot(interaction: discord.Interaction, enabled: bool):
-    await set_boolean_setting(interaction, "anti_bot", enabled)
-
-
-@bot.tree.command(name="set-spam-action", description="Set anti-spam punishment.")
-@app_commands.checks.has_permissions(manage_guild=True)
+@bot.tree.command(name="spam-action", description="Choose the anti-spam punishment.")
+@manage_guild_only()
 @app_commands.choices(action=[
     app_commands.Choice(name="Timeout", value="timeout"),
     app_commands.Choice(name="Kick", value="kick"),
     app_commands.Choice(name="Ban", value="ban")
 ])
-async def set_spam_action(
+async def spam_action(
     interaction: discord.Interaction,
     action: app_commands.Choice[str]
 ):
-    update_setting(interaction.guild_id, "spam_action", action.value)
+    set_setting(interaction.guild_id, "spam_action", action.value)
     await interaction.response.send_message(
-        f"Anti-spam action set to {action.name}.",
+        f"Anti-spam action set to {action.name}.", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="security-settings",
+    description="Show this server's security settings."
+)
+@manage_guild_only()
+async def security_settings(interaction: discord.Interaction):
+    s = get_settings(interaction.guild_id)
+    channel = (
+        f"<#{s['log_channel_id']}>"
+        if s["log_channel_id"] else "Not configured"
+    )
+
+    await interaction.response.send_message(
+        f"Log channel: {channel}\n"
+        f"Anti-spam: {'ON' if s['antispam'] else 'OFF'}\n"
+        f"Anti-nuke monitoring: {'ON' if s['antinuke'] else 'OFF'}\n"
+        f"Anti-bot alerts: {'ON' if s['antibot'] else 'OFF'}\n"
+        f"Spam limit: {s['spam_limit']} messages in {s['spam_window']} seconds\n"
+        f"Spam action: {s['spam_action']}",
         ephemeral=True
     )
 
@@ -976,12 +952,12 @@ async def set_spam_action(
     name="authorize-member",
     description="Allow a member to bypass anti-spam."
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@manage_guild_only()
 async def authorize_member(
     interaction: discord.Interaction,
     member: discord.Member
 ):
-    with sqlite3.connect(DATABASE) as db:
+    with db_connect() as db:
         db.execute(
             "INSERT OR IGNORE INTO authorized_members VALUES (?, ?)",
             (interaction.guild_id, member.id)
@@ -989,25 +965,23 @@ async def authorize_member(
         db.commit()
 
     await interaction.response.send_message(
-        f"{member} is now authorized.",
-        ephemeral=True
+        f"{member} is now authorized.", ephemeral=True
     )
 
 
-@bot.tree.command(name="trust-bot", description="Trust a bot in this server.")
-@app_commands.checks.has_permissions(manage_guild=True)
+@bot.tree.command(name="trust-bot", description="Add a bot to the trusted list.")
+@manage_guild_only()
 async def trust_bot(
     interaction: discord.Interaction,
     bot_member: discord.Member
 ):
     if not bot_member.bot:
         await interaction.response.send_message(
-            "Choose a bot account.",
-            ephemeral=True
+            "Select a bot account.", ephemeral=True
         )
         return
 
-    with sqlite3.connect(DATABASE) as db:
+    with db_connect() as db:
         db.execute(
             "INSERT OR IGNORE INTO trusted_bots VALUES (?, ?)",
             (interaction.guild_id, bot_member.id)
@@ -1015,46 +989,45 @@ async def trust_bot(
         db.commit()
 
     await interaction.response.send_message(
-        f"{bot_member} is now on the trusted-bot list.",
+        f"{bot_member} added to the trusted-bot list.",
         ephemeral=True
     )
 
 
-# ---------------- ANNOUNCEMENTS ----------------
+# ============================================================
+# ANNOUNCEMENTS
+# ============================================================
 
-@bot.tree.command(name="announcement", description="Send an announcement.")
-@app_commands.checks.has_permissions(manage_guild=True)
+@bot.tree.command(name="announcement", description="Send a server announcement.")
+@manage_guild_only()
 async def announcement(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
     message: str
 ):
-    embed = make_embed("Announcement", message)
-
+    embed = create_embed("Announcement", message)
     await channel.send(
         embed=embed,
         allowed_mentions=discord.AllowedMentions.none()
     )
-
     await interaction.response.send_message(
-        f"Announcement sent to {channel.mention}.",
-        ephemeral=True
+        f"Announcement sent to {channel.mention}.", ephemeral=True
     )
-
     await send_log(
-        interaction.guild,
-        "Announcement Sent",
+        interaction.guild, "Announcement Sent",
         f"By: {interaction.user}\nChannel: {channel.mention}"
     )
 
 
-# ---------------- AUTORESPONDER ----------------
+# ============================================================
+# AUTORESPONDER
+# ============================================================
 
 @bot.tree.command(
     name="autoresponder-add",
-    description="Create an automatic keyword response."
+    description="Add a keyword response."
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@manage_guild_only()
 async def autoresponder_add(
     interaction: discord.Interaction,
     trigger: str,
@@ -1062,12 +1035,12 @@ async def autoresponder_add(
 ):
     if len(trigger) > 100 or len(response) > 1500:
         await interaction.response.send_message(
-            "Trigger must be at most 100 characters and response at most 1500.",
+            "Trigger limit is 100 characters; response limit is 1500.",
             ephemeral=True
         )
         return
 
-    with sqlite3.connect(DATABASE) as db:
+    with db_connect() as db:
         db.execute(
             "INSERT OR REPLACE INTO autoresponders VALUES (?, ?, ?)",
             (interaction.guild_id, trigger.casefold(), response)
@@ -1075,21 +1048,20 @@ async def autoresponder_add(
         db.commit()
 
     await interaction.response.send_message(
-        f"Autoresponder added for `{trigger}`.",
-        ephemeral=True
+        f"Autoresponder added for `{trigger}`.", ephemeral=True
     )
 
 
 @bot.tree.command(
     name="autoresponder-remove",
-    description="Remove an automatic keyword response."
+    description="Remove a keyword response."
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@manage_guild_only()
 async def autoresponder_remove(
     interaction: discord.Interaction,
     trigger: str
 ):
-    with sqlite3.connect(DATABASE) as db:
+    with db_connect() as db:
         cursor = db.execute(
             "DELETE FROM autoresponders WHERE guild_id = ? AND trigger = ?",
             (interaction.guild_id, trigger.casefold())
@@ -1102,10 +1074,19 @@ async def autoresponder_remove(
     )
 
 
-# ---------------- SIMPLE GIVEAWAY ----------------
+# ============================================================
+# GIVEAWAY
+# ============================================================
 
-@bot.tree.command(name="giveaway", description="Start a simple timed giveaway.")
-@app_commands.checks.has_permissions(manage_guild=True)
+async def finish_giveaway(channel_id, message_id, guild_id, prize):
+    try:
+        await asyncio.sleep(60)  # replaced by the command's duration below
+    except asyncio.CancelledError:
+        return
+
+
+@bot.tree.command(name="giveaway", description="Start a timed giveaway.")
+@manage_guild_only()
 async def giveaway(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
@@ -1119,69 +1100,69 @@ async def giveaway(
         )
         return
 
-    end_time = int(time.time()) + minutes * 60
-    embed = make_embed(
+    end_timestamp = int(time.time()) + minutes * 60
+    embed = create_embed(
         "Giveaway",
         f"Prize: {prize}\n"
         f"Hosted by: {interaction.user.mention}\n"
-        f"Ends: <t:{end_time}:R>\n\n"
-        "React with the ticket reaction below to enter."
+        f"Ends: <t:{end_timestamp}:R>\n\n"
+        "React with the giveaway reaction to enter."
     )
 
     message = await channel.send(embed=embed)
     await message.add_reaction("🎉")
 
     await interaction.response.send_message(
-        f"Giveaway started in {channel.mention}.",
-        ephemeral=True
+        f"Giveaway started in {channel.mention}.", ephemeral=True
     )
 
-    await asyncio.sleep(minutes * 60)
+    async def end_giveaway():
+        await asyncio.sleep(minutes * 60)
+        try:
+            current = await channel.fetch_message(message.id)
+            reaction = discord.utils.get(current.reactions, emoji="🎉")
 
-    try:
-        message = await channel.fetch_message(message.id)
-        reaction = discord.utils.get(message.reactions, emoji="🎉")
+            if reaction is None:
+                await channel.send(f"Giveaway ended. No winner for: {prize}")
+                return
 
-        if reaction is None:
-            await channel.send(f"Giveaway ended. No winner was selected for: {prize}")
-            return
+            entrants = [
+                user async for user in reaction.users()
+                if not user.bot
+            ]
 
-        users = [
-            user async for user in reaction.users()
-            if not user.bot
-        ]
+            if not entrants:
+                await channel.send(f"Giveaway ended. No entries for: {prize}")
+                return
 
-        if not users:
-            await channel.send(f"Giveaway ended. No entries for: {prize}")
-            return
+            winner = random.choice(entrants)
+            await channel.send(
+                f"Giveaway ended. Winner: {winner.mention}. Prize: {prize}"
+            )
+            await send_log(
+                interaction.guild, "Giveaway Ended",
+                f"Prize: {prize}\nWinner: {winner}\nChannel: {channel.mention}"
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
 
-        winner = users[0]
-        await channel.send(f"Giveaway ended. Winner: {winner.mention}. Prize: {prize}")
-
-        await send_log(
-            interaction.guild,
-            "Giveaway Ended",
-            f"Prize: {prize}\nWinner: {winner}\nChannel: {channel.mention}"
-        )
-
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        pass
+    task = asyncio.create_task(end_giveaway())
+    giveaway_tasks[message.id] = task
 
 
-# ---------------- ERROR HANDLING ----------------
+# ============================================================
+# COMMAND ERROR HANDLING
+# ============================================================
 
 @bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError
-):
+async def on_app_command_error(interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         message = "You do not have permission to use this command."
     elif isinstance(error, app_commands.CheckFailure):
         message = "You are not authorized to use this command."
     else:
-        message = "The command failed. Check the bot console for details."
         print(f"Slash command error: {repr(error)}")
+        message = "The command failed. Check the bot console."
 
     try:
         if interaction.response.is_done():
@@ -1192,7 +1173,9 @@ async def on_app_command_error(
         pass
 
 
-# ---------------- RUN ----------------
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     init_db()
