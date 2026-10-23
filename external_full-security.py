@@ -15,7 +15,7 @@ from discord.ext import commands
 # Multi-server Discord security and moderation bot
 # ============================================================
 
-TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+TOKEN = os.getenv("DISCORD_TOKEN").strip()
 
 # Global bot owner. Keep your owner ID here.
 OWNER_IDS = {1460495693536825479}
