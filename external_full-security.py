@@ -20,8 +20,6 @@ from aiohttp import web
 
 TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 
-# Your Discord user ID.
-# Only these IDs can use owner-only security commands.
 OWNER_IDS = {1460495693536825479}
 
 DATABASE = "external_security.db"
@@ -267,7 +265,7 @@ async def audit_actor(guild, action, target_id=None):
 
 
 # ============================================================
-# OWNER-ONLY CHECK
+# OWNER-ONLY CHECKS
 # ============================================================
 
 def owner_only():
@@ -304,7 +302,6 @@ class SecurityBot(commands.Bot):
 
         init_db()
 
-        # Render Web Service health endpoint.
         app = web.Application()
         app.router.add_get("/", health_check)
         app.router.add_get("/health", health_check)
@@ -324,7 +321,6 @@ class SecurityBot(commands.Bot):
 
         print(f"Health server listening on port {port}")
 
-        # Register global slash commands.
         try:
             synced = await self.tree.sync()
             print(f"Registered {len(synced)} slash commands.")
@@ -352,6 +348,388 @@ bot = SecurityBot(
 
 
 # ============================================================
+# OWNER-ONLY SERVER SETTINGS PANEL
+# ============================================================
+
+SERVER_SETTINGS_OWNER_IDS = {1460495693536825479}
+
+
+def is_server_settings_owner(user_id: int) -> bool:
+    return user_id in SERVER_SETTINGS_OWNER_IDS
+
+
+class ServerSettingsView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ) -> bool:
+        if not is_server_settings_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "You are not authorized to use this panel.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(
+        label="Server List",
+        style=discord.ButtonStyle.primary
+    )
+    async def server_list_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guilds = sorted(
+            bot.guilds,
+            key=lambda guild: guild.name.casefold()
+        )
+
+        if not guilds:
+            await interaction.response.send_message(
+                "The bot is not in any servers.",
+                ephemeral=True
+            )
+            return
+
+        view = ServerListView(guilds)
+
+        await interaction.response.send_message(
+            embed=view.make_embed(),
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Server Remove",
+        style=discord.ButtonStyle.danger
+    )
+    async def server_remove_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guilds = sorted(
+            bot.guilds,
+            key=lambda guild: guild.name.casefold()
+        )
+
+        if not guilds:
+            await interaction.response.send_message(
+                "The bot is not in any servers.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "Select the server you want the bot to leave.",
+            view=ServerRemoveSelectView(guilds),
+            ephemeral=True
+        )
+
+
+class ServerListView(discord.ui.View):
+
+    def __init__(self, guilds):
+        super().__init__(timeout=180)
+        self.guilds = guilds
+        self.page = 0
+        self.page_size = 10
+        self.update_buttons()
+
+    def make_embed(self):
+        start = self.page * self.page_size
+        current = self.guilds[start:start + self.page_size]
+
+        total_pages = max(
+            1,
+            (len(self.guilds) + self.page_size - 1)
+            // self.page_size
+        )
+
+        embed = discord.Embed(
+            title="EXTERNAL | FULL SECURITY",
+            description=(
+                f"**Server List**\n"
+                f"Total servers: `{len(self.guilds)}`\n"
+                f"Page: `{self.page + 1}/{total_pages}`"
+            ),
+            color=discord.Color.blurple()
+        )
+
+        for index, guild in enumerate(current, start=start + 1):
+            embed.add_field(
+                name=f"{index}. {guild.name[:240]}",
+                value=f"Server ID: `{guild.id}`",
+                inline=False
+            )
+
+        embed.set_footer(
+            text="Private owner-only server list"
+        )
+
+        return embed
+
+    def update_buttons(self):
+        self.clear_items()
+
+        previous_button = discord.ui.Button(
+            label="Previous",
+            style=discord.ButtonStyle.secondary,
+            disabled=(self.page <= 0)
+        )
+        previous_button.callback = self.previous_page
+        self.add_item(previous_button)
+
+        next_button = discord.ui.Button(
+            label="Next",
+            style=discord.ButtonStyle.secondary,
+            disabled=(
+                (self.page + 1) * self.page_size
+                >= len(self.guilds)
+            )
+        )
+        next_button.callback = self.next_page
+        self.add_item(next_button)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ) -> bool:
+        if not is_server_settings_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "You are not authorized to use this panel.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    async def previous_page(self, interaction):
+        self.page = max(0, self.page - 1)
+        self.update_buttons()
+
+        await interaction.response.edit_message(
+            embed=self.make_embed(),
+            view=self
+        )
+
+    async def next_page(self, interaction):
+        max_page = max(
+            0,
+            (len(self.guilds) - 1) // self.page_size
+        )
+
+        self.page = min(max_page, self.page + 1)
+        self.update_buttons()
+
+        await interaction.response.edit_message(
+            embed=self.make_embed(),
+            view=self
+        )
+
+
+class ServerRemoveSelect(discord.ui.Select):
+
+    def __init__(self, guilds):
+        self.guild_lookup = {
+            guild.id: guild for guild in guilds
+        }
+
+        options = [
+            discord.SelectOption(
+                label=guild.name[:100],
+                value=str(guild.id),
+                description=f"Server ID: {guild.id}"
+            )
+            for guild in guilds[:25]
+        ]
+
+        super().__init__(
+            placeholder="Choose a server to remove the bot from",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+        if not is_server_settings_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "You are not authorized to use this panel.",
+                ephemeral=True
+            )
+            return
+
+        guild_id = int(self.values[0])
+        guild = bot.get_guild(guild_id)
+
+        if guild is None:
+            await interaction.response.send_message(
+                "That server could not be found.",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="Confirm Server Removal",
+            description=(
+                "Are you sure you want the bot to leave this server?\n\n"
+                f"**Server:** {guild.name}\n"
+                f"**Server ID:** `{guild.id}`\n\n"
+                "The bot will stop providing its services in this server."
+            ),
+            color=discord.Color.red()
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=ServerRemoveConfirmView(guild.id),
+            ephemeral=True
+        )
+
+
+class ServerRemoveSelectView(discord.ui.View):
+
+    def __init__(self, guilds):
+        super().__init__(timeout=180)
+        self.add_item(ServerRemoveSelect(guilds))
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ) -> bool:
+        if not is_server_settings_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "You are not authorized to use this panel.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+
+class ServerRemoveConfirmView(discord.ui.View):
+
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ) -> bool:
+        if not is_server_settings_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "You are not authorized to use this panel.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(
+        label="Confirm Remove",
+        style=discord.ButtonStyle.danger
+    )
+    async def confirm_remove(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = bot.get_guild(self.guild_id)
+
+        if guild is None:
+            await interaction.response.edit_message(
+                content="The bot is no longer in that server.",
+                embed=None,
+                view=None
+            )
+            return
+
+        guild_name = guild.name
+
+        await interaction.response.edit_message(
+            content=f"Leaving **{guild_name}**...",
+            embed=None,
+            view=None
+        )
+
+        try:
+            await guild.leave()
+        except discord.HTTPException as exc:
+            print(f"Failed to leave guild {self.guild_id}: {exc}")
+
+            await interaction.followup.send(
+                "Failed to leave the server. Check the Render logs.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(
+            f"The bot has left **{guild_name}**.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary
+    )
+    async def cancel_remove(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Server removal cancelled.",
+            embed=None,
+            view=None
+        )
+
+
+@bot.tree.command(
+    name="server-setting",
+    description="Open the owner-only server management panel."
+)
+async def server_setting(
+    interaction: discord.Interaction
+):
+    if not is_server_settings_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "You are not authorized to use this command.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="EXTERNAL | FULL SECURITY",
+        description=(
+            "**Server Settings Panel**\n\n"
+            "Manage the servers this bot belongs to.\n\n"
+            f"**Total Servers:** `{len(bot.guilds)}`\n\n"
+            "Choose an action below."
+        ),
+        color=discord.Color.blurple()
+    )
+
+    embed.set_footer(
+        text="Owner-only panel | Private interaction"
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=ServerSettingsView(),
+        ephemeral=True
+    )
+
+# ============================================================
 # STARTUP
 # ============================================================
 
@@ -367,12 +745,8 @@ async def on_ready():
             invite_cache[guild.id] = {
                 inv.code: {
                     "uses": inv.uses or 0,
-                    "inviter_id": (
-                        inv.inviter.id if inv.inviter else None
-                    ),
-                    "channel_id": (
-                        inv.channel.id if inv.channel else None
-                    )
+                    "inviter_id": inv.inviter.id if inv.inviter else None,
+                    "channel_id": inv.channel.id if inv.channel else None
                 }
                 for inv in invites
             }
@@ -431,7 +805,8 @@ async def all_logs_channel(
 async def help_command(interaction: discord.Interaction):
     message = (
         "**EXTERNAL | FULL SECURITY COMMANDS**\n\n"
-        "**Owner-only security settings**\n"
+        "**Owner-only commands**\n"
+        "`/server-setting`\n"
         "`/all-logs-channel`\n"
         "`/antinuke`\n"
         "`/antispam`\n"
@@ -444,11 +819,10 @@ async def help_command(interaction: discord.Interaction):
         "`/autoresponder-remove`\n"
         "`/announcement`\n"
         "`/giveaway`\n\n"
-        "**Server moderation permissions required**\n"
+        "**Moderation commands**\n"
         "`/kick`\n"
         "`/ban`\n"
-        "`/addmembersrole`\n\n"
-        "Use the command options shown by Discord."
+        "`/addmembersrole`\n"
     )
 
     await interaction.response.send_message(
@@ -668,9 +1042,7 @@ async def on_guild_update(before, after):
         )
 
     if before.verification_level != after.verification_level:
-        changes.append(
-            "Verification level changed."
-        )
+        changes.append("Verification level changed.")
 
     if not changes:
         return
@@ -686,9 +1058,10 @@ async def on_guild_update(before, after):
         await send_log(
             after,
             "Anti-Nuke Monitoring Alert",
-            f"Changes:\n" + "\n".join(changes) + "\n"
-            f"Changed by: {actor or 'Unknown'}\n"
-            f"Reason: {reason or 'Unknown'}",
+            "Changes:\n"
+            + "\n".join(changes)
+            + f"\nChanged by: {actor or 'Unknown'}\n"
+            + f"Reason: {reason or 'Unknown'}",
             discord.Color.orange()
         )
 
@@ -714,10 +1087,7 @@ async def on_message(message):
 
         queue.append(now)
 
-        while (
-            queue
-            and now - queue[0] > settings["spam_window"]
-        ):
+        while queue and now - queue[0] > settings["spam_window"]:
             queue.popleft()
 
         if len(queue) >= settings["spam_limit"]:
@@ -726,9 +1096,7 @@ async def on_message(message):
             try:
                 await message.channel.purge(
                     limit=settings["spam_limit"],
-                    check=lambda item: (
-                        item.author.id == message.author.id
-                    )
+                    check=lambda item: item.author.id == message.author.id
                 )
             except (discord.Forbidden, discord.HTTPException):
                 pass
@@ -738,18 +1106,15 @@ async def on_message(message):
                     await message.author.kick(
                         reason="Automatic anti-spam"
                     )
-
                 elif settings["spam_action"] == "ban":
                     await message.author.ban(
                         reason="Automatic anti-spam"
                     )
-
                 else:
                     await message.author.timeout(
                         timedelta(minutes=1),
                         reason="Automatic anti-spam"
                     )
-
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
@@ -872,9 +1237,7 @@ async def spam_action(
 )
 @owner_only()
 @app_commands.guild_only()
-async def security_settings(
-    interaction: discord.Interaction
-):
+async def security_settings(interaction: discord.Interaction):
     settings = get_settings(interaction.guild_id)
 
     channel = (
@@ -1045,7 +1408,9 @@ async def addmembersrole(
     member: discord.Member,
     role: discord.Role
 ):
-    if role >= interaction.guild.me.top_role:
+    bot_member = interaction.guild.me
+
+    if bot_member is None or role >= bot_member.top_role:
         await interaction.response.send_message(
             "That role is above or equal to the bot's highest role.",
             ephemeral=True
@@ -1069,7 +1434,6 @@ async def addmembersrole(
             f"Added {role.name} to {member}.",
             ephemeral=True
         )
-
     except discord.Forbidden:
         await interaction.response.send_message(
             "The bot cannot assign that role.",
@@ -1231,6 +1595,7 @@ async def giveaway(
 
         try:
             current = await channel.fetch_message(message.id)
+
             reaction = discord.utils.get(
                 current.reactions,
                 emoji="🎉"
@@ -1265,6 +1630,8 @@ async def giveaway(
             discord.HTTPException
         ):
             pass
+        finally:
+            giveaway_tasks.pop(message.id, None)
 
     giveaway_tasks[message.id] = asyncio.create_task(finish())
 
@@ -1296,7 +1663,6 @@ async def on_app_command_error(interaction, error):
                 message,
                 ephemeral=True
             )
-
     except discord.HTTPException:
         pass
 
