@@ -2786,9 +2786,30 @@ async def get_or_create_jail_role(guild):
         )
 
     for channel in guild.text_channels:
-                member: discord.Member,
-        reason: str = "No reason provided"
-    ):
+        await channel.set_permissions(
+            role,
+            send_messages=False,
+            add_reactions=False,
+            create_public_threads=False,
+            create_private_threads=False,
+            send_messages_in_threads=False,
+            reason="Configure jail role"
+        )
+
+    return role
+
+
+@bot.tree.command(
+    name="jail",
+    description="Restrict a member using the jail role."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def jail_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided"
+):
         if not moderator_has_permission(
             interaction, "manage_roles"
         ):
