@@ -2892,46 +2892,24 @@ async def jail_command(
                 """,
                 (
                     interaction.guild_id,
-                    member.id,
-                    json.dumps(previous_roles),
-                    int(time.time()),
-                    interaction.user.id
-                )
-            )
-            db.commit()
-
-        await interaction.followup.send(
-            f"{member.mention} has been jailed.",
-            ephemeral=True
-        )
-
-        await moderation_log(
-            interaction.guild,
-            "Jail",
-            interaction.user,
-            member,
-            reason
-        )
-
-
-    @bot.tree.command(
-        name="unjail",
-        description="Release a jailed member."
-    )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def unjail_command(
-        interaction: discord.Interaction,
-        member: discord.Member
+@bot.tree.command(
+    name="unjail",
+    description="Release a jailed member."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def unjail_command(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+    if not moderator_has_permission(
+        interaction, "manage_roles"
     ):
-        if not moderator_has_permission(
-            interaction, "manage_roles"
-        ):
-            return await deny_permission(interaction)
+        return await deny_permission(interaction)
 
-        allowed, error = can_manage_target(
-            interaction, member
-        )
+    allowed, error = can_manage_target(
+        interaction, member
+    )
 
         if not allowed:
             await interaction.response.send_message(
