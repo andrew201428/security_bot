@@ -695,7 +695,7 @@ def get_premium_record(guild_id):
             WHERE guild_id = ?
             """,
             (guild_id,)
-                    ).fetchone()
+        ).fetchone()
 
     return dict(row) if row else None
 
@@ -2089,7 +2089,7 @@ async def process_security_filters(message):
         "AutoMod Action",
         (
             f"Member: {message.author.mention}\n"
-                f"Member ID: `{message.author.id}`\n"
+            f"Member ID: `{message.author.id}`\n"
             f"Channel: {message.channel.mention}\n"
             f"Reason: {violation}\n"
             "Action: Message deleted"
@@ -2810,88 +2810,110 @@ async def jail_command(
     member: discord.Member,
     reason: str = "No reason provided"
 ):
-        if not moderator_has_permission(
-            interaction, "manage_roles"
-        ):
-            return await deny_permission(interaction)
+    if not moderator_has_permission(
+        interaction, "manage_roles"
+    ):
+        return await deny_permission(interaction)
 
-        allowed, error = can_manage_target(
-            interaction, member
+    allowed, error = can_manage_target(
+        interaction, member
+    )
+
+    if not allowed:
+        await interaction.response.send_message(
+            error,
+            ephemeral=True
+        )
+        return
+
+    with db_connect() as db:
+        existing = db.execute(
+            """
+            SELECT 1 FROM jailed_members
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (interaction.guild_id, member.id)
+        ).fetchone()
+
+    if existing:
+        await interaction.response.send_message(
+            "This member is already jailed.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        role = await get_or_create_jail_role(
+            interaction.guild
         )
 
-        if not allowed:
-            await interaction.response.send_message(
-                error,
-                ephemeral=True
-            )
-            return
+        me = interaction.guild.me
 
-        with db_connect() as db:
-            existing = db.execute(
-                """
-                SELECT 1 FROM jailed_members
-                WHERE guild_id = ? AND user_id = ?
-                """,
-                (interaction.guild_id, member.id)
-            ).fetchone()
+        previous_roles = [
+            r.id for r in member.roles
+            if r != interaction.guild.default_role
+            and not r.managed
+            and r < me.top_role
+        ]
 
-        if existing:
-            await interaction.response.send_message(
-                "This member is already jailed.",
-                ephemeral=True
-            )
-            return
+        removable_roles = [
+            r for r in member.roles
+            if r.id in previous_roles
+        ]
 
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            role = await get_or_create_jail_role(
-                interaction.guild
+        if removable_roles:
+            await member.remove_roles(
+                *removable_roles,
+                reason=f"Jailed by {interaction.user}"
             )
 
-            me = interaction.guild.me
+        await member.add_roles(
+            role,
+            reason=reason
+        )
 
-            previous_roles = [
-                r.id for r in member.roles
-                if r != interaction.guild.default_role
-                and not r.managed
-                and r < me.top_role
-            ]
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(
+            "Could not jail the member. "
+            "Check bot permissions and role hierarchy.",
+            ephemeral=True
+        )
+        return
 
-            removable_roles = [
-                r for r in member.roles
-                if r.id in previous_roles
-            ]
-
-            if removable_roles:
-                await member.remove_roles(
-                    *removable_roles,
-                    reason=f"Jailed by {interaction.user}"
-                )
-
-            await member.add_roles(
-                role,
-                reason=reason
+    with db_connect() as db:
+        db.execute(
+            """
+            INSERT INTO jailed_members
+            (guild_id, user_id, previous_roles,
+             jailed_at, jailed_by)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                interaction.guild_id,
+                member.id,
+                json.dumps(previous_roles),
+                int(time.time()),
+                interaction.user.id
             )
+        )
+        db.commit()
 
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.followup.send(
-                "Could not jail the member. "
-                "Check bot permissions and role hierarchy.",
-                ephemeral=True
-            )
-            return
+    await interaction.followup.send(
+        f"{member.mention} has been jailed.",
+        ephemeral=True
+    )
 
-        with db_connect() as db:
-            db.execute(
-                """
-                INSERT INTO jailed_members
-                (guild_id, user_id, previous_roles,
-                 jailed_at, jailed_by)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    interaction.guild_id,
+    await moderation_log(
+        interaction.guild,
+        "Jail",
+        interaction.user,
+        member,
+        reason
+    )
+
+
 @bot.tree.command(
     name="unjail",
     description="Release a jailed member."
@@ -2911,557 +2933,557 @@ async def unjail_command(
         interaction, member
     )
 
-        if not allowed:
-            await interaction.response.send_message(
-                error,
-                ephemeral=True
-            )
-            return
-
-        with db_connect() as db:
-            record = db.execute(
-                """
-                SELECT previous_roles
-                FROM jailed_members
-                WHERE guild_id = ? AND user_id = ?
-                """,
-                (interaction.guild_id, member.id)
-            ).fetchone()
-
-        if record is None:
-            await interaction.response.send_message(
-                "This member is not jailed.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        role = discord.utils.get(
-            interaction.guild.roles,
-            name="EXTERNAL | JAILED"
+    if not allowed:
+        await interaction.response.send_message(
+            error,
+            ephemeral=True
         )
+        return
 
-        previous_ids = json.loads(
-            record["previous_roles"]
+    with db_connect() as db:
+        record = db.execute(
+            """
+            SELECT previous_roles
+            FROM jailed_members
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (interaction.guild_id, member.id)
+        ).fetchone()
+
+    if record is None:
+        await interaction.response.send_message(
+            "This member is not jailed.",
+            ephemeral=True
         )
+        return
 
-        me = interaction.guild.me
+    await interaction.response.defer(ephemeral=True)
 
-        restore_roles = [
-            r for r in interaction.guild.roles
-            if r.id in previous_ids
-            and not r.managed
-            and r < me.top_role
-        ]
+    role = discord.utils.get(
+        interaction.guild.roles,
+        name="EXTERNAL | JAILED"
+    )
 
-        try:
-            if role in member.roles:
-                await member.remove_roles(
-                    role,
-                    reason="Member unjailed"
-                )
+    previous_ids = json.loads(
+        record["previous_roles"]
+    )
 
-            if restore_roles:
-                await member.add_roles(
-                    *restore_roles,
-                    reason="Restore roles after jail"
-                )
+    me = interaction.guild.me
 
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.followup.send(
-                "Failed to restore member roles.",
-                ephemeral=True
+    restore_roles = [
+        r for r in interaction.guild.roles
+        if r.id in previous_ids
+        and not r.managed
+        and r < me.top_role
+    ]
+
+    try:
+        if role in member.roles:
+            await member.remove_roles(
+                role,
+                reason="Member unjailed"
             )
-            return
 
-        with db_connect() as db:
-            db.execute(
-                """
-                DELETE FROM jailed_members
-                WHERE guild_id = ? AND user_id = ?
-                """,
-                (interaction.guild_id, member.id)
+        if restore_roles:
+            await member.add_roles(
+                *restore_roles,
+                reason="Restore roles after jail"
             )
-            db.commit()
 
+    except (discord.Forbidden, discord.HTTPException):
         await interaction.followup.send(
-            f"{member.mention} has been unjailed.",
+            "Failed to restore member roles.",
             ephemeral=True
         )
+        return
 
-        await moderation_log(
-            interaction.guild,
-            "Unjail",
-            interaction.user,
-            member,
-            "Released from jail"
+    with db_connect() as db:
+        db.execute(
+            """
+            DELETE FROM jailed_members
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (interaction.guild_id, member.id)
         )
+        db.commit()
 
-
-    @bot.tree.command(
-        name="jlist",
-        description="Show currently jailed members."
+    await interaction.followup.send(
+        f"{member.mention} has been unjailed.",
+        ephemeral=True
     )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def jlist_command(
-        interaction: discord.Interaction
-    ):
-        with db_connect() as db:
-            rows = db.execute(
-                """
-                SELECT user_id, jailed_at
-                FROM jailed_members
-                WHERE guild_id = ?
-                ORDER BY jailed_at DESC
-                LIMIT 30
-                """,
-                (interaction.guild_id,)
-            ).fetchall()
 
-        lines = [
-            f"<@{row['user_id']}> "
-            f"— <t:{row['jailed_at']}:R>"
-            for row in rows
-        ]
-
-        await interaction.response.send_message(
-            embed=create_embed(
-                "EXTERNAL | JAIL LIST",
-                "\n".join(lines)
-                if lines else "No jailed members."
-            ),
-            ephemeral=True
-        )
-
-
-    # ============================================================
-    # CHANNEL LOCK SYSTEM
-    # ============================================================
-
-    def init_channel_lock_db():
-        with db_connect() as db:
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS channel_locks (
-                    channel_id INTEGER PRIMARY KEY,
-                    guild_id INTEGER NOT NULL,
-                    previous_send_messages INTEGER
-                )
-                """
-            )
-            db.commit()
-
-
-    @bot.tree.command(
-        name="lock",
-        description="Lock a text channel."
+    await moderation_log(
+        interaction.guild,
+        "Unjail",
+        interaction.user,
+        member,
+        "Released from jail"
     )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def lock_command(
-        interaction: discord.Interaction,
-        channel: discord.TextChannel = None
-    ):
-        if not moderator_has_permission(
-            interaction, "manage_channels"
-        ):
-            return await deny_permission(interaction)
-
-        channel = channel or interaction.channel
-
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message(
-                "Select a text channel.",
-                ephemeral=True
-            )
-            return
-
-        init_channel_lock_db()
-
-        with db_connect() as db:
-            existing = db.execute(
-                "SELECT 1 FROM channel_locks WHERE channel_id = ?",
-                (channel.id,)
-            ).fetchone()
-
-        if existing:
-            await interaction.response.send_message(
-                "This channel is already locked by the bot.",
-                ephemeral=True
-            )
-            return
-
-        overwrite = channel.overwrites_for(
-            interaction.guild.default_role
-        )
-
-        previous = overwrite.send_messages
-
-        previous_value = (
-            None if previous is None
-            else int(previous)
-        )
-
-        overwrite.send_messages = False
-
-        try:
-            await channel.set_permissions(
-                interaction.guild.default_role,
-                overwrite=overwrite,
-                reason=f"Locked by {interaction.user}"
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.response.send_message(
-                "Failed to lock the channel.",
-                ephemeral=True
-            )
-            return
-
-        with db_connect() as db:
-            db.execute(
-                """
-                INSERT INTO channel_locks
-                (channel_id, guild_id, previous_send_messages)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    channel.id,
-                    interaction.guild_id,
-                    previous_value
-                )
-            )
-            db.commit()
-
-        await interaction.response.send_message(
-            f"Locked {channel.mention}.",
-            ephemeral=True
-        )
 
 
-    @bot.tree.command(
-        name="unlock",
-        description="Restore a channel's previous send permission."
+@bot.tree.command(
+    name="jlist",
+    description="Show currently jailed members."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def jlist_command(
+    interaction: discord.Interaction
+):
+    with db_connect() as db:
+        rows = db.execute(
+            """
+            SELECT user_id, jailed_at
+            FROM jailed_members
+            WHERE guild_id = ?
+            ORDER BY jailed_at DESC
+            LIMIT 30
+            """,
+            (interaction.guild_id,)
+        ).fetchall()
+
+    lines = [
+        f"<@{row['user_id']}> "
+        f"— <t:{row['jailed_at']}:R>"
+        for row in rows
+    ]
+
+    await interaction.response.send_message(
+        embed=create_embed(
+            "EXTERNAL | JAIL LIST",
+            "\n".join(lines)
+            if lines else "No jailed members."
+        ),
+        ephemeral=True
     )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def unlock_command(
-        interaction: discord.Interaction,
-        channel: discord.TextChannel = None
+
+
+# ============================================================
+# CHANNEL LOCK SYSTEM
+# ============================================================
+
+def init_channel_lock_db():
+    with db_connect() as db:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_locks (
+                channel_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                previous_send_messages INTEGER
+            )
+            """
+        )
+        db.commit()
+
+
+@bot.tree.command(
+    name="lock",
+    description="Lock a text channel."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def lock_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None
+):
+    if not moderator_has_permission(
+        interaction, "manage_channels"
     ):
-        if not moderator_has_permission(
-            interaction, "manage_channels"
-        ):
-            return await deny_permission(interaction)
+        return await deny_permission(interaction)
 
-        channel = channel or interaction.channel
+    channel = channel or interaction.channel
 
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message(
-                "Select a text channel.",
-                ephemeral=True
-            )
-            return
-
-        init_channel_lock_db()
-
-        with db_connect() as db:
-            record = db.execute(
-                """
-                SELECT previous_send_messages
-                FROM channel_locks
-                WHERE channel_id = ?
-                  AND guild_id = ?
-                """,
-                (channel.id, interaction.guild_id)
-            ).fetchone()
-
-        if record is None:
-            await interaction.response.send_message(
-                "No saved lock state for this channel.",
-                ephemeral=True
-            )
-            return
-
-        previous = record["previous_send_messages"]
-
-        overwrite = channel.overwrites_for(
-            interaction.guild.default_role
-        )
-
-        overwrite.send_messages = (
-            None if previous is None
-            else bool(previous)
-        )
-
-        try:
-            await channel.set_permissions(
-                interaction.guild.default_role,
-                overwrite=overwrite,
-                reason=f"Unlocked by {interaction.user}"
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.response.send_message(
-                "Failed to unlock the channel.",
-                ephemeral=True
-            )
-            return
-
-        with db_connect() as db:
-            db.execute(
-                "DELETE FROM channel_locks WHERE channel_id = ?",
-                (channel.id,)
-            )
-            db.commit()
-
+    if not isinstance(channel, discord.TextChannel):
         await interaction.response.send_message(
-            f"Unlocked {channel.mention}.",
+            "Select a text channel.",
             ephemeral=True
         )
+        return
+
+    init_channel_lock_db()
+
+    with db_connect() as db:
+        existing = db.execute(
+            "SELECT 1 FROM channel_locks WHERE channel_id = ?",
+            (channel.id,)
+        ).fetchone()
+
+    if existing:
+        await interaction.response.send_message(
+            "This channel is already locked by the bot.",
+            ephemeral=True
+        )
+        return
+
+    overwrite = channel.overwrites_for(
+        interaction.guild.default_role
+    )
+
+    previous = overwrite.send_messages
+
+    previous_value = (
+        None if previous is None
+        else int(previous)
+    )
+
+    overwrite.send_messages = False
+
+    try:
+        await channel.set_permissions(
+            interaction.guild.default_role,
+            overwrite=overwrite,
+            reason=f"Locked by {interaction.user}"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.response.send_message(
+            "Failed to lock the channel.",
+            ephemeral=True
+        )
+        return
+
+    with db_connect() as db:
+        db.execute(
+            """
+            INSERT INTO channel_locks
+            (channel_id, guild_id, previous_send_messages)
+            VALUES (?, ?, ?)
+            """,
+            (
+                channel.id,
+                interaction.guild_id,
+                previous_value
+            )
+        )
+        db.commit()
+
+    await interaction.response.send_message(
+        f"Locked {channel.mention}.",
+        ephemeral=True
+    )
 
 
-    # ============================================================
-    # PURGE SYSTEM
-    # ============================================================
+@bot.tree.command(
+    name="unlock",
+    description="Restore a channel's previous send permission."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def unlock_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None
+):
+    if not moderator_has_permission(
+        interaction, "manage_channels"
+    ):
+        return await deny_permission(interaction)
 
-    async def purge_messages(
+    channel = channel or interaction.channel
+
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Select a text channel.",
+            ephemeral=True
+        )
+        return
+
+    init_channel_lock_db()
+
+    with db_connect() as db:
+        record = db.execute(
+            """
+            SELECT previous_send_messages
+            FROM channel_locks
+            WHERE channel_id = ?
+              AND guild_id = ?
+            """,
+            (channel.id, interaction.guild_id)
+        ).fetchone()
+
+    if record is None:
+        await interaction.response.send_message(
+            "No saved lock state for this channel.",
+            ephemeral=True
+        )
+        return
+
+    previous = record["previous_send_messages"]
+
+    overwrite = channel.overwrites_for(
+        interaction.guild.default_role
+    )
+
+    overwrite.send_messages = (
+        None if previous is None
+        else bool(previous)
+    )
+
+    try:
+        await channel.set_permissions(
+            interaction.guild.default_role,
+            overwrite=overwrite,
+            reason=f"Unlocked by {interaction.user}"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.response.send_message(
+            "Failed to unlock the channel.",
+            ephemeral=True
+        )
+        return
+
+    with db_connect() as db:
+        db.execute(
+            "DELETE FROM channel_locks WHERE channel_id = ?",
+            (channel.id,)
+        )
+        db.commit()
+
+    await interaction.response.send_message(
+        f"Unlocked {channel.mention}.",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# PURGE SYSTEM
+# ============================================================
+
+async def purge_messages(
+    interaction,
+    amount,
+    check=None
+):
+    if not moderator_has_permission(
+        interaction, "manage_messages"
+    ):
+        return await deny_permission(interaction)
+
+    if not isinstance(
+        interaction.channel,
+        discord.TextChannel
+    ):
+        await interaction.response.send_message(
+            "Use this command in a text channel.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        deleted = await interaction.channel.purge(
+            limit=amount,
+            check=check,
+            reason=f"Purge requested by {interaction.user}"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(
+            "Purge failed. Check Manage Messages permission.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        f"Deleted {len(deleted)} message(s).",
+        ephemeral=True
+    )
+
+    await advanced_send_log(
+        interaction.guild,
+        "moderation_logs",
+        "Message Purge",
+        (
+            f"Moderator: {interaction.user.mention}\n"
+            f"Channel: {interaction.channel.mention}\n"
+            f"Messages deleted: {len(deleted)}"
+        )
+    )
+
+
+@bot.tree.command(
+    name="purge",
+    description="Delete recent messages from this channel."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def purge_command(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 100]
+):
+    await purge_messages(interaction, amount)
+
+
+@bot.tree.command(
+    name="purgeuser",
+    description="Delete recent messages from a selected member."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def purgeuser_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, 1, 100] = 25
+):
+    await purge_messages(
         interaction,
         amount,
-        check=None
-    ):
-        if not moderator_has_permission(
-            interaction, "manage_messages"
-        ):
-            return await deny_permission(interaction)
-
-        if not isinstance(
-            interaction.channel,
-            discord.TextChannel
-        ):
-            await interaction.response.send_message(
-                "Use this command in a text channel.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            deleted = await interaction.channel.purge(
-                limit=amount,
-                check=check,
-                reason=f"Purge requested by {interaction.user}"
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.followup.send(
-                "Purge failed. Check Manage Messages permission.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.followup.send(
-            f"Deleted {len(deleted)} message(s).",
-            ephemeral=True
-        )
-
-        await advanced_send_log(
-            interaction.guild,
-            "moderation_logs",
-            "Message Purge",
-            (
-                f"Moderator: {interaction.user.mention}\n"
-                f"Channel: {interaction.channel.mention}\n"
-                f"Messages deleted: {len(deleted)}"
-            )
-        )
-
-
-    @bot.tree.command(
-        name="purge",
-        description="Delete recent messages from this channel."
+        check=lambda message: message.author.id == member.id
     )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def purge_command(
-        interaction: discord.Interaction,
-        amount: app_commands.Range[int, 1, 100]
-    ):
-        await purge_messages(interaction, amount)
 
 
-    @bot.tree.command(
-        name="purgeuser",
-        description="Delete recent messages from a selected member."
-    )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def purgeuser_command(
-        interaction: discord.Interaction,
-        member: discord.Member,
-        amount: app_commands.Range[int, 1, 100] = 25
-    ):
-        await purge_messages(
-            interaction,
-            amount,
-            check=lambda message: message.author.id == member.id
-        )
-
-
-    @bot.tree.command(
-        name="purgebot",
-        description="Delete recent messages from a selected bot."
-    )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def purgebot_command(
-        interaction: discord.Interaction,
-        bot_member: discord.Member,
-        amount: app_commands.Range[int, 1, 100] = 25
-    ):
-        if not bot_member.bot:
-            await interaction.response.send_message(
-                "The selected member is not a bot.",
-                ephemeral=True
-            )
-            return
-
-        await purge_messages(
-            interaction,
-            amount,
-            check=lambda message: (
-                message.author.id == bot_member.id
-            )
-        )
-
-
-    # ============================================================
-    # TIMEOUT / UNMUTE
-    # ============================================================
-
-    @bot.tree.command(
-        name="timeout",
-        description="Temporarily timeout a member."
-    )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def timeout_command(
-        interaction: discord.Interaction,
-        member: discord.Member,
-        minutes: app_commands.Range[int, 1, 40320],
-        reason: str = "No reason provided"
-    ):
-        if not moderator_has_permission(
-            interaction, "moderate_members"
-        ):
-            return await deny_permission(interaction)
-
-        allowed, error = can_manage_target(
-            interaction, member
-        )
-
-        if not allowed:
-            await interaction.response.send_message(
-                error,
-                ephemeral=True
-            )
-            return
-
-        try:
-            await member.timeout(
-                timedelta(minutes=minutes),
-                reason=reason
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.response.send_message(
-                "Failed to timeout the member.",
-                ephemeral=True
-            )
-            return
-
+@bot.tree.command(
+    name="purgebot",
+    description="Delete recent messages from a selected bot."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def purgebot_command(
+    interaction: discord.Interaction,
+    bot_member: discord.Member,
+    amount: app_commands.Range[int, 1, 100] = 25
+):
+    if not bot_member.bot:
         await interaction.response.send_message(
-            f"Timed out {member.mention} for {minutes} minute(s).",
+            "The selected member is not a bot.",
             ephemeral=True
         )
+        return
 
-        await moderation_log(
-            interaction.guild,
-            "Timeout",
-            interaction.user,
-            member,
-            reason
+    await purge_messages(
+        interaction,
+        amount,
+        check=lambda message: (
+            message.author.id == bot_member.id
         )
-
-
-    @bot.tree.command(
-        name="unmute",
-        description="Remove a member's timeout."
     )
-    @app_commands.guild_only()
-    @medium_permission_only()
-    async def unmute_command(
-        interaction: discord.Interaction,
-        member: discord.Member
+
+
+# ============================================================
+# TIMEOUT / UNMUTE
+# ============================================================
+
+@bot.tree.command(
+    name="timeout",
+    description="Temporarily timeout a member."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def timeout_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str = "No reason provided"
+):
+    if not moderator_has_permission(
+        interaction, "moderate_members"
     ):
-        if not moderator_has_permission(
-            interaction, "moderate_members"
-        ):
-            return await deny_permission(interaction)
+        return await deny_permission(interaction)
 
-        allowed, error = can_manage_target(
-            interaction, member
-        )
+    allowed, error = can_manage_target(
+        interaction, member
+    )
 
-        if not allowed:
-            await interaction.response.send_message(
-                error,
-                ephemeral=True
-            )
-            return
-
-        try:
-            await member.timeout(
-                None,
-                reason=f"Unmuted by {interaction.user}"
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.response.send_message(
-                "Failed to remove timeout.",
-                ephemeral=True
-            )
-            return
-
+    if not allowed:
         await interaction.response.send_message(
-            f"Removed timeout from {member.mention}.",
+            error,
             ephemeral=True
         )
+        return
 
-
-    # ============================================================
-    # HIGH-LEVEL MODERATION
-    # ============================================================
-
-    def high_moderation_allowed(interaction, permission):
-        if not is_high_authorized(
-            interaction.guild,
-            interaction.user.id
-        ):
-            return False
-
-        return moderator_has_permission(
-            interaction,
-            permission
+    try:
+        await member.timeout(
+            timedelta(minutes=minutes),
+            reason=reason
         )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.response.send_message(
+            "Failed to timeout the member.",
+            ephemeral=True
+        )
+        return
 
-
-    @bot.tree.command(
-        name="kick",
-        description="Kick a member from the server."
+    await interaction.response.send_message(
+        f"Timed out {member.mention} for {minutes} minute(s).",
+        ephemeral=True
     )
-    @app_commands.guild_only()
-    async def kick_command_v2(
-        interaction: discord.Interaction,
-            member: discord.Member,
+
+    await moderation_log(
+        interaction.guild,
+        "Timeout",
+        interaction.user,
+        member,
+        reason
+    )
+
+
+@bot.tree.command(
+    name="unmute",
+    description="Remove a member's timeout."
+)
+@app_commands.guild_only()
+@medium_permission_only()
+async def unmute_command(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+    if not moderator_has_permission(
+        interaction, "moderate_members"
+    ):
+        return await deny_permission(interaction)
+
+    allowed, error = can_manage_target(
+        interaction, member
+    )
+
+    if not allowed:
+        await interaction.response.send_message(
+            error,
+            ephemeral=True
+        )
+        return
+
+    try:
+        await member.timeout(
+            None,
+            reason=f"Unmuted by {interaction.user}"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.response.send_message(
+            "Failed to remove timeout.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Removed timeout from {member.mention}.",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# HIGH-LEVEL MODERATION
+# ============================================================
+
+def high_moderation_allowed(interaction, permission):
+    if not is_high_authorized(
+        interaction.guild,
+        interaction.user.id
+    ):
+        return False
+
+    return moderator_has_permission(
+        interaction,
+        permission
+    )
+
+
+@bot.tree.command(
+    name="kick",
+    description="Kick a member from the server."
+)
+@app_commands.guild_only()
+async def kick_command_v2(
+    interaction: discord.Interaction,
+    member: discord.Member,
     reason: str = "No reason provided"
 ):
     if not high_moderation_allowed(
@@ -4158,653 +4180,702 @@ async def stick_remove(
             WHERE guild_id = ? AND channel_id = ?
             """,
             (
-                                discord.HTTPException
-            ):
-                continue
-
-        if not member.bot:
-            eligible.append(member)
-
-    if not eligible:
-        return False, "No eligible giveaway entries."
-
-    winner = secrets.choice(eligible)
-
-    if not reroll:
-        with db_connect() as db:
-            db.execute(
-                """
-                UPDATE giveaways
-                SET status = 'ended'
-                WHERE message_id = ?
-                """,
-                (message_id,)
+                interaction.guild_id,
+                interaction.channel_id
             )
-            db.commit()
-
-    channel = guild.get_channel(
-        giveaway["channel_id"]
-    )
-
-    if channel is not None:
-        try:
-            await channel.send(
-                embed=create_embed(
-                    "EXTERNAL | GIVEAWAY WINNER",
-                    (
-                        f"**Prize:** "
-                        f"{discord.utils.escape_markdown(giveaway['prize'])}\n"
-                        f"**Winner:** {winner.mention}\n"
-                        f"**Message ID:** `{message_id}`"
-                    )
-                ),
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    return True, winner
-
-
-@giveaway_group.command(
-    name="end",
-    description="End a giveaway and select a winner."
-)
-@medium_permission_only()
-async def giveaway_end_command(
-    interaction: discord.Interaction,
-    message_id: str
-):
-    if not moderator_has_permission(
-        interaction, "manage_guild"
-    ):
-        return await deny_permission(interaction)
-
-    try:
-        target_id = int(message_id)
-    except ValueError:
-        await interaction.response.send_message(
-            "Invalid message ID.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    success, result = await finish_giveaway(
-        target_id
-    )
-
-    if not success:
-        await interaction.followup.send(
-            result,
-            ephemeral=True
-        )
-        return
-
-    await interaction.followup.send(
-        f"Giveaway ended. Winner: {result.mention}",
-        ephemeral=True
-    )
-
-
-@giveaway_group.command(
-    name="reroll",
-    description="Select another giveaway winner."
-)
-@medium_permission_only()
-async def giveaway_reroll_command(
-    interaction: discord.Interaction,
-    message_id: str
-):
-    if not moderator_has_permission(
-        interaction, "manage_guild"
-    ):
-        return await deny_permission(interaction)
-
-    try:
-        target_id = int(message_id)
-    except ValueError:
-        await interaction.response.send_message(
-            "Invalid message ID.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    success, result = await finish_giveaway(
-        target_id,
-        reroll=True
-    )
-
-    if not success:
-        await interaction.followup.send(
-            result,
-            ephemeral=True
-        )
-        return
-
-    await interaction.followup.send(
-        f"New winner: {result.mention}",
-        ephemeral=True
-    )
-
-
-bot.tree.add_command(giveaway_group)
-
-
-# ============================================================
-# GIVEAWAY BACKGROUND TASK
-# ============================================================
-
-@tasks.loop(seconds=30)
-async def giveaway_watcher():
-    init_giveaway_entries()
-
-    now = int(time.time())
-
-    with db_connect() as db:
-        rows = db.execute(
-            """
-            SELECT message_id
-            FROM giveaways
-            WHERE status = 'active'
-              AND ends_at <= ?
-            """,
-            (now,)
-        ).fetchall()
-
-    for row in rows:
-        try:
-            await finish_giveaway(
-                row["message_id"]
-            )
-        except Exception as exc:
-            print(
-                f"[GIVEAWAY] Failed to finish "
-                f"{row['message_id']}: {exc}"
-            )
-
-
-@giveaway_watcher.before_loop
-async def before_giveaway_watcher():
-    await bot.wait_until_ready()
-
-
-# ============================================================
-# EVENT REMINDER DATABASE
-# ============================================================
-
-def init_event_reminders():
-    with db_connect() as db:
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS event_reminders (
-                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                channel_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                description TEXT,
-                event_time INTEGER NOT NULL,
-                created_by INTEGER NOT NULL,
-                reminded INTEGER DEFAULT 0
-            )
-            """
         )
         db.commit()
 
-
-# ============================================================
-# EVENT COMMAND GROUP
-# ============================================================
-
-event_group = app_commands.Group(
-    name="event",
-    description="Manage server event reminders."
-)
-
-
-@event_group.command(
-    name="create",
-    description="Create an event reminder."
-)
-@medium_permission_only()
-async def event_create_command(
-    interaction: discord.Interaction,
-    title: str,
-    minutes_from_now: app_commands.Range[int, 1, 525600],
-    description: str = "No description provided"
-):
-    if not moderator_has_permission(
-        interaction, "manage_events"
-    ):
-        return await deny_permission(interaction)
-
-    init_event_reminders()
-
-    event_time = (
-        int(time.time()) + minutes_from_now * 60
+    await interaction.response.send_message(
+        (
+            "Sticky message removed."
+            if cursor.rowcount
+            else "No sticky message configured."
+        ),
+        ephemeral=True
     )
 
+
+@stick_group.command(
+    name="view",
+    description="View the configured sticky message."
+)
+@medium_permission_only()
+async def stick_view(
+    interaction: discord.Interaction
+):
     with db_connect() as db:
-        cursor = db.execute(
+        record = db.execute(
             """
-            INSERT INTO event_reminders
-            (guild_id, channel_id, title, description,
-             event_time, created_by, reminded)
-            VALUES (?, ?, ?, ?, ?, ?, 0)
+            SELECT message, enabled
+            FROM sticky_messages
+            WHERE guild_id = ? AND channel_id = ?
             """,
             (
                 interaction.guild_id,
-                interaction.channel_id,
-                title[:100],
-                description[:1000],
-                event_time,
-                interaction.user.id
+                interaction.channel_id
+            )
+        ).fetchone()
+
+    if record is None:
+        await interaction.response.send_message(
+            "No sticky message configured.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        embed=create_embed(
+            "EXTERNAL | STICKY MESSAGE",
+            discord.utils.escape_markdown(
+                record["message"]
+            )
+        ),
+        ephemeral=True
+    )
+
+
+bot.tree.add_command(stick_group)
+
+
+# ============================================================
+# STICKY MESSAGE PROCESSOR
+# Called by the final on_message handler.
+# ============================================================
+
+async def process_sticky_message(message):
+    if message.guild is None or message.author.bot:
+        return
+
+    channel = message.channel
+
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    with db_connect() as db:
+        record = db.execute(
+            """
+            SELECT message, last_message_id
+            FROM sticky_messages
+            WHERE guild_id = ?
+              AND channel_id = ?
+              AND enabled = 1
+            """,
+            (
+                message.guild.id,
+                channel.id
+            )
+        ).fetchone()
+
+    if record is None:
+        return
+
+    key = (message.guild.id, channel.id)
+
+    now = time.monotonic()
+
+    if now - sticky_cooldowns.get(key, 0) < 15:
+        return
+
+    sticky_cooldowns[key] = now
+
+    old_message_id = record["last_message_id"]
+
+    if old_message_id:
+        try:
+            old_message = await channel.fetch_message(
+                old_message_id
+            )
+            await old_message.delete()
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException
+        ):
+            pass
+
+    try:
+        new_message = await channel.send(
+            embed=create_embed(
+                "EXTERNAL | STICKY MESSAGE",
+                discord.utils.escape_markdown(
+                    record["message"]
+                )
+            ),
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        return
+
+    with db_connect() as db:
+        db.execute(
+            """
+            UPDATE sticky_messages
+            SET last_message_id = ?
+            WHERE guild_id = ? AND channel_id = ?
+            """,
+            (
+                new_message.id,
+                message.guild.id,
+                channel.id
             )
         )
         db.commit()
 
-        event_id = cursor.lastrowid
 
-    await interaction.response.send_message(
-        embed=create_embed(
-            "EXTERNAL | EVENT CREATED",
-            (
-                f"**Event ID:** `{event_id}`\n"
-                f"**Title:** {discord.utils.escape_markdown(title[:100])}\n"
-                f"**Time:** <t:{event_time}:F>\n"
-                f"**Description:** "
-                f"{discord.utils.escape_markdown(description[:500])}"
+# ============================================================
+# END OF PART 5
+# ============================================================
+
+
+
+# ============================================================
+# EXTERNAL | FULL SECURITY v2.0
+# PART 6 - PREMIUM COMMANDS
+# ============================================================
+
+
+# ============================================================
+# PREMIUM PERMISSION CHECK
+# ============================================================
+
+def premium_admin_only():
+
+    async def predicate(interaction):
+        if interaction.guild is None:
+            raise app_commands.CheckFailure(
+                "This command is server-only."
             )
+
+        if not is_premium(interaction.guild.id):
+            raise app_commands.CheckFailure(
+                "This server does not have premium."
+            )
+
+        if not is_high_authorized(
+            interaction.guild,
+            interaction.user.id
+        ):
+            raise app_commands.CheckFailure(
+                "Only the server owner or bot owner "
+                "can use this premium command."
+            )
+
+        return True
+
+    return app_commands.check(predicate)
+
+
+def premium_permission_allowed(interaction, permission):
+    return bool(
+        interaction.user.guild_permissions.administrator
+        or getattr(
+            interaction.user.guild_permissions,
+            permission,
+            False
         )
     )
 
 
-@event_group.command(
-    name="list",
-    description="List upcoming server events."
+# ============================================================
+# PREMIUM SCRIPT LIBRARY
+# ============================================================
+
+leak_group = app_commands.Group(
+    name="leak",
+    description="Share your own or public scripts."
 )
-@medium_permission_only()
-async def event_list_command(
+
+
+@leak_group.command(
+    name="script",
+    description="Publish a script in the server."
+)
+@app_commands.guild_only()
+@premium_admin_only()
+async def leak_script_command(
+    interaction: discord.Interaction,
+    name: str,
+    language: str,
+    description: str,
+    source_url: str
+):
+    source_url = source_url.strip()
+
+    if not source_url.startswith(
+        ("https://", "http://")
+    ):
+        await interaction.response.send_message(
+            "Provide a valid public source URL.",
+            ephemeral=True
+        )
+        return
+
+    if len(name) > 100 or len(description) > 1000:
+        await interaction.response.send_message(
+            "Script name or description is too long.",
+            ephemeral=True
+        )
+        return
+
+    embed = create_embed(
+        "EXTERNAL | SCRIPT LIBRARY",
+        (
+            f"**Script:** "
+            f"{discord.utils.escape_markdown(name)}\n"
+            f"**Language:** "
+            f"{discord.utils.escape_markdown(language[:60])}\n\n"
+            f"**Description:**\n"
+            f"{discord.utils.escape_markdown(description)}"
+        )
+    )
+
+    embed.add_field(
+        name="Public Source",
+        value=discord.utils.escape_markdown(
+            source_url[:1000]
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Shared By",
+        value=interaction.user.mention,
+        inline=False
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+bot.tree.add_command(leak_group)
+
+
+# ============================================================
+# PREMIUM MEMBER BYPASS
+# ============================================================
+
+bypass_group = app_commands.Group(
+    name="bypass",
+    description="Manage premium security exemptions."
+)
+
+bypass_member_group = app_commands.Group(
+    name="member",
+    description="Manage member filter exemptions.",
+    parent=bypass_group
+)
+
+bypass_bot_group = app_commands.Group(
+    name="bot",
+    description="Manage trusted bots.",
+    parent=bypass_group
+)
+
+
+BYPASS_FILTER_CHOICES = [
+    app_commands.Choice(
+        name="All AutoMod Filters",
+        value="all"
+    ),
+    app_commands.Choice(
+        name="Anti-Link",
+        value="antilink"
+    ),
+    app_commands.Choice(
+        name="Anti-Mention",
+        value="antimention"
+    ),
+    app_commands.Choice(
+        name="Anti-NSFW",
+        value="antinsfw"
+    )
+]
+
+
+@bypass_member_group.command(
+    name="add",
+    description="Exempt a member from a selected filter."
+)
+@app_commands.choices(filter_name=BYPASS_FILTER_CHOICES)
+@premium_admin_only()
+async def bypass_member_add(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    filter_name: app_commands.Choice[str]
+):
+    with db_connect() as db:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO premium_bypass
+            (guild_id, target_id, bypass_type)
+            VALUES (?, ?, ?)
+            """,
+            (
+                interaction.guild_id,
+                member.id,
+                filter_name.value
+            )
+        )
+        db.commit()
+
+    await interaction.response.send_message(
+        f"Added exemption for {member.mention}: "
+        f"{filter_name.name}.",
+        ephemeral=True
+    )
+
+
+@bypass_member_group.command(
+    name="remove",
+    description="Remove a member's filter exemption."
+)
+@app_commands.choices(filter_name=BYPASS_FILTER_CHOICES)
+@premium_admin_only()
+async def bypass_member_remove(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    filter_name: app_commands.Choice[str]
+):
+    with db_connect() as db:
+        cursor = db.execute(
+            """
+            DELETE FROM premium_bypass
+            WHERE guild_id = ?
+              AND target_id = ?
+              AND bypass_type = ?
+            """,
+            (
+                interaction.guild_id,
+                member.id,
+                filter_name.value
+            )
+        )
+        db.commit()
+
+    await interaction.response.send_message(
+        (
+            "Member exemption removed."
+            if cursor.rowcount
+            else "No matching exemption found."
+        ),
+        ephemeral=True
+    )
+
+
+@bypass_member_group.command(
+    name="list",
+    description="List premium member exemptions."
+)
+@premium_admin_only()
+async def bypass_member_list(
     interaction: discord.Interaction
 ):
-    init_event_reminders()
-
     with db_connect() as db:
         rows = db.execute(
             """
-            SELECT event_id, title, event_time
-            FROM event_reminders
+            SELECT target_id, bypass_type
+            FROM premium_bypass
             WHERE guild_id = ?
-              AND reminded = 0
-            ORDER BY event_time
-            LIMIT 20
+            ORDER BY target_id
+            LIMIT 40
             """,
             (interaction.guild_id,)
         ).fetchall()
 
     lines = [
-        (
-            f"`{row['event_id']}` "
-            f"**{discord.utils.escape_markdown(row['title'])}** "
-            f"— <t:{row['event_time']}:R>"
-        )
+        f"<@{row['target_id']}> - "
+        f"`{row['bypass_type']}`"
         for row in rows
     ]
 
     await interaction.response.send_message(
         embed=create_embed(
-            "EXTERNAL | UPCOMING EVENTS",
+            "Premium Member Bypass",
             "\n".join(lines)
-            if lines else "No upcoming events."
+            if lines else "No member exemptions."
         ),
         ephemeral=True
     )
 
 
-@event_group.command(
-    name="cancel",
-    description="Cancel an event reminder."
+# ============================================================
+# PREMIUM TRUSTED BOTS
+# ============================================================
+
+@bypass_bot_group.command(
+    name="add",
+    description="Add a trusted bot."
 )
-@medium_permission_only()
-async def event_cancel_command(
+@premium_admin_only()
+async def bypass_bot_add(
     interaction: discord.Interaction,
-    event_id: int
+    member: discord.Member
 ):
-    if not moderator_has_permission(
-        interaction, "manage_events"
-    ):
-        return await deny_permission(interaction)
+    if not member.bot:
+        await interaction.response.send_message(
+            "Selected member is not a bot.",
+            ephemeral=True
+        )
+        return
 
-    init_event_reminders()
+    with db_connect() as db:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO trusted_bots
+            (guild_id, bot_id)
+            VALUES (?, ?)
+            """,
+            (interaction.guild_id, member.id)
+        )
+        db.commit()
 
+    await interaction.response.send_message(
+        f"Trusted bot added: {member.mention}.",
+        ephemeral=True
+    )
+
+
+@bypass_bot_group.command(
+    name="remove",
+    description="Remove a trusted bot."
+)
+@premium_admin_only()
+async def bypass_bot_remove(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
     with db_connect() as db:
         cursor = db.execute(
             """
-            DELETE FROM event_reminders
-            WHERE event_id = ?
-              AND guild_id = ?
+            DELETE FROM trusted_bots
+            WHERE guild_id = ?
+              AND bot_id = ?
             """,
-            (event_id, interaction.guild_id)
+            (interaction.guild_id, member.id)
         )
         db.commit()
 
     await interaction.response.send_message(
         (
-            "Event cancelled."
+            "Trusted bot removed."
             if cursor.rowcount
-            else "Event not found."
+            else "Bot is not on the trusted list."
         ),
         ephemeral=True
     )
 
 
-bot.tree.add_command(event_group)
-
-
-# ============================================================
-# EVENT REMINDER WATCHER
-# ============================================================
-
-@tasks.loop(seconds=30)
-async def event_reminder_watcher():
-    init_event_reminders()
-
-    now = int(time.time())
-
+@bypass_bot_group.command(
+    name="list",
+    description="List trusted bots."
+)
+@premium_admin_only()
+async def bypass_bot_list(
+    interaction: discord.Interaction
+):
     with db_connect() as db:
         rows = db.execute(
             """
-            SELECT *
-            FROM event_reminders
-            WHERE reminded = 0
-              AND event_time <= ?
+            SELECT bot_id
+            FROM trusted_bots
+            WHERE guild_id = ?
+            LIMIT 40
             """,
-            (now,)
+            (interaction.guild_id,)
         ).fetchall()
 
-    for row in rows:
-        guild = bot.get_guild(row["guild_id"])
-
-        if guild is None:
-            continue
-
-        channel = guild.get_channel(
-            row["channel_id"]
+    content = (
+        "\n".join(
+            f"<@{row['bot_id']}> (`{row['bot_id']}`)"
+            for row in rows
         )
+        if rows else "No trusted bots."
+    )
 
-        if channel is None:
-            with db_connect() as db:
-                db.execute(
-                    """
-                    UPDATE event_reminders
-                    SET reminded = 1
-                    WHERE event_id = ?
-                    """,
-                    (row["event_id"],)
-                )
-                db.commit()
-            continue
-
-        try:
-            await channel.send(
-                embed=create_embed(
-                    "EXTERNAL | EVENT REMINDER",
-                    (
-                        f"**Event:** "
-                        f"{discord.utils.escape_markdown(row['title'])}\n"
-                        f"**Description:** "
-                        f"{discord.utils.escape_markdown(row['description'] or '')}\n"
-                        f"**Scheduled:** <t:{row['event_time']}:F>"
-                    )
-                ),
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            continue
-
-        with db_connect() as db:
-            db.execute(
-                """
-                UPDATE event_reminders
-                SET reminded = 1
-                WHERE event_id = ?
-                """,
-                (row["event_id"],)
-            )
-            db.commit()
+    await interaction.response.send_message(
+        embed=create_embed(
+            "EXTERNAL | TRUSTED BOTS",
+            content
+        ),
+        ephemeral=True
+    )
 
 
-@event_reminder_watcher.before_loop
-async def before_event_reminder_watcher():
-    await bot.wait_until_ready()
+bot.tree.add_command(bypass_group)
 
 
 # ============================================================
-# PREMIUM ANNOUNCEMENT COMMAND
+# PREMIUM SERVER BAN LIST
 # ============================================================
 
 @bot.tree.command(
-    name="announcement",
-    description="Post a formatted server announcement."
+    name="server-ban-list",
+    description="View the server's banned users."
 )
 @app_commands.guild_only()
 @premium_admin_only()
-async def announcement_command(
-    interaction: discord.Interaction,
-    title: str,
-    message: str,
-    channel: discord.TextChannel = None
+async def server_ban_list_command(
+    interaction: discord.Interaction
 ):
     if not premium_permission_allowed(
-        interaction, "manage_messages"
+        interaction, "ban_members"
+    ):
+        await deny_permission(interaction)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    entries = []
+
+    try:
+        async for ban_entry in interaction.guild.bans(
+            limit=30
+        ):
+            user = ban_entry.user
+            entries.append(
+                f"{discord.utils.escape_markdown(str(user))} "
+                f"(`{user.id}`)"
+            )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(
+            "Unable to retrieve the ban list.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        embed=create_embed(
+            "EXTERNAL | SERVER BAN LIST",
+            "\n".join(entries)
+            if entries else "No bans found."
+        ),
+        ephemeral=True
+    )
+
+
+# ============================================================
+# PREMIUM INVITE CREATION
+# ============================================================
+
+@bot.tree.command(
+    name="create-invite",
+    description="Create a Discord server invite."
+)
+@app_commands.guild_only()
+@premium_admin_only()
+async def create_invite_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None,
+    hours: app_commands.Range[int, 0, 168] = 24,
+    max_uses: app_commands.Range[int, 0, 100] = 0
+):
+    if not premium_permission_allowed(
+        interaction, "create_instant_invite"
     ):
         await deny_permission(interaction)
         return
 
     channel = channel or interaction.channel
 
-    if len(title) > 200 or len(message) > 3500:
+    if not isinstance(channel, discord.TextChannel):
         await interaction.response.send_message(
-            "Announcement is too long.",
-            ephemeral=True
-        )
-        return
-
-    embed = create_embed(
-        title[:200],
-        message[:3500]
-    )
-
-    embed.set_footer(
-        text=f"Announcement by {interaction.user}"
-    )
-
-    try:
-        await channel.send(
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-    except (discord.Forbidden, discord.HTTPException):
-        await interaction.response.send_message(
-            "Failed to post announcement.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        f"Announcement posted in {channel.mention}.",
-        ephemeral=True
-    )
-
-
-# ============================================================
-# PREMIUM ROLE MANAGER
-# ============================================================
-
-role_group = app_commands.Group(
-    name="role",
-    description="Premium role management."
-)
-
-
-@role_group.command(
-    name="add",
-    description="Give a role to a member."
-)
-@premium_admin_only()
-async def premium_role_add(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    role: discord.Role
-):
-    if not premium_permission_allowed(
-        interaction, "manage_roles"
-    ):
-        await deny_permission(interaction)
-        return
-
-    if role >= interaction.guild.me.top_role:
-        await interaction.response.send_message(
-            "I cannot manage a role equal to or above my top role.",
-            ephemeral=True
-        )
-        return
-
-    if role.is_default() or role.managed:
-        await interaction.response.send_message(
-            "That role cannot be assigned.",
+            "Select a text channel.",
             ephemeral=True
         )
         return
 
     try:
-        await member.add_roles(
-            role,
-            reason=f"Assigned by {interaction.user}"
+        invite = await channel.create_invite(
+            max_age=hours * 3600,
+            max_uses=max_uses,
+            unique=True,
+            reason=f"Created by {interaction.user}"
         )
     except (discord.Forbidden, discord.HTTPException):
         await interaction.response.send_message(
-            "Failed to assign role.",
+            "Unable to create invite.",
             ephemeral=True
         )
         return
 
     await interaction.response.send_message(
-        f"Added {role.mention} to {member.mention}.",
+        f"Invite created:\n{invite.url}",
         ephemeral=True
     )
-
-
-@role_group.command(
-    name="remove",
-    description="Remove a role from a member."
-)
-@premium_admin_only()
-async def premium_role_remove(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    role: discord.Role
-):
-    if not premium_permission_allowed(
-        interaction, "manage_roles"
-    ):
-        await deny_permission(interaction)
-        return
-
-    if role >= interaction.guild.me.top_role:
-        await interaction.response.send_message(
-            "I cannot manage that role.",
-            ephemeral=True
-        )
-        return
-
-    try:
-        await member.remove_roles(
-            role,
-            reason=f"Removed by {interaction.user}"
-        )
-    except (discord.Forbidden, discord.HTTPException):
-        await interaction.response.send_message(
-            "Failed to remove role.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        f"Removed {role.mention} from {member.mention}.",
-        ephemeral=True
-    )
-
-
-bot.tree.add_command(role_group)
 
 
 # ============================================================
-# PREMIUM ROLE ALL
+# PREMIUM EMOJI IMPORT
 # ============================================================
 
 @bot.tree.command(
-    name="role-all",
-    description="Assign a role to every server member."
+    name="steal-emoji",
+    description="Import an emoji from an image attachment."
 )
 @app_commands.guild_only()
 @premium_admin_only()
-async def role_all_command(
+async def steal_emoji_command(
     interaction: discord.Interaction,
-    role: discord.Role
+    name: str,
+    image: discord.Attachment
 ):
     if not premium_permission_allowed(
-        interaction, "manage_roles"
+        interaction, "manage_emojis_and_stickers"
     ):
         await deny_permission(interaction)
         return
 
-    if role.is_default() or role.managed:
+    if not re.fullmatch(r"[A-Za-z0-9_]{2,32}", name):
         await interaction.response.send_message(
-            "That role cannot be assigned.",
+            "Emoji name must be 2-32 letters, "
+            "numbers or underscores.",
             ephemeral=True
         )
         return
 
-    if role >= interaction.guild.me.top_role:
+    if image.size > 256 * 1024:
         await interaction.response.send_message(
-            "I cannot manage that role.",
+            "Image must be 256 KB or smaller.",
+            ephemeral=True
+        )
+        return
+
+    if not image.filename.lower().endswith(
+        (".png", ".jpg", ".jpeg", ".gif")
+    ):
+        await interaction.response.send_message(
+            "Upload a PNG, JPG or GIF image.",
             ephemeral=True
         )
         return
 
     await interaction.response.defer(ephemeral=True)
 
-    success = 0
-    failed = 0
+    try:
+        data = await image.read()
 
-    for member in interaction.guild.members:
-        if member.bot or role in member.roles:
-            continue
+        emoji = await interaction.guild.create_custom_emoji(
+            name=name,
+            image=data,
+            reason=f"Imported by {interaction.user}"
+        )
 
-        try:
-            await member.add_roles(
-                role,
-                reason=f"Role-all requested by {interaction.user}"
-            )
-            success += 1
-        except (discord.Forbidden, discord.HTTPException):
-            failed += 1
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(
+            "Emoji import failed. Check permissions, "
+            "image format and available emoji slots.",
+            ephemeral=True
+        )
+        return
 
     await interaction.followup.send(
-        f"Role assignment completed.\n"
-        f"Successful: {success}\n"
-        f"Failed: {failed}",
+        f"Emoji created: {emoji}",
         ephemeral=True
     )
 
-
-# ============================================================
-# END OF PART 7
-# ============================================================
 
 # ============================================================
 # PREMIUM STICKER IMPORT
@@ -5458,6 +5529,7 @@ async def giveaway_list_command(
         ephemeral=True
     )
 
+
 async def finish_giveaway(message_id, reroll=False):
     init_giveaway_entries()
 
@@ -5503,9 +5575,6 @@ async def finish_giveaway(message_id, reroll=False):
                 discord.NotFound,
                 discord.Forbidden,
                 discord.HTTPException
-            ):
-                continue
-                                discord.HTTPException
             ):
                 continue
 
@@ -5634,8 +5703,7 @@ async def giveaway_reroll_command(
     if not moderator_has_permission(
         interaction, "manage_guild"
     ):
-        await deny_permission(interaction)
-        return
+        return await deny_permission(interaction)
 
     try:
         giveaway_id = int(message_id)
@@ -5729,7 +5797,8 @@ async def auto_event_add(
         )
         event_id = cursor.lastrowid
         db.commit()
-            await interaction.response.send_message(
+
+    await interaction.response.send_message(
         f"Scheduled event created.\n"
         f"Event ID: `{event_id}`\n"
         f"Channel: {channel.mention}\n"
@@ -5948,7 +6017,8 @@ async def ensure_all_logs_channel(guild):
             return None
 
         try:
-            channel = await guild.create_text_channel(                "all-logs",
+            channel = await guild.create_text_channel(
+                "all-logs",
                 overwrites={
                     guild.default_role:
                         discord.PermissionOverwrite(
@@ -6200,7 +6270,8 @@ async def autoresponder_add(interaction: discord.Interaction, trigger: str, resp
         await interaction.response.send_message("Trigger must be 1-80 characters and response 1-1500 characters.", ephemeral=True)
         return
     with db_connect() as db:
-        db.execute("INSERT OR REPLACE INTO autoresponders (guild_id, trigger, response) VALUES (?, ?)",                    (interaction.guild_id, trigger, response))
+        db.execute("INSERT OR REPLACE INTO autoresponders (guild_id, trigger, response) VALUES (?, ?, ?)",
+                   (interaction.guild_id, trigger, response))
         db.commit()
     await interaction.response.send_message(f"Autoresponder saved for `{discord.utils.escape_markdown(trigger)}`.", ephemeral=True)
 
@@ -6400,6 +6471,7 @@ async def process_external_antispam(message):
     )
 
     return True
+
 
 # ============================================================
 # MESSAGE EVENT
@@ -6621,6 +6693,7 @@ async def on_guild_join(guild):
         guild.name,
         guild.id
     )
+
 
 # ============================================================
 # AUTOMATIC GIVEAWAY PROCESSOR
