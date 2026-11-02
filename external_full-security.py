@@ -6199,6 +6199,29 @@ async def autoreactchannel_command(interaction: discord.Interaction, channel: di
     await interaction.response.send_message(f"Auto-reaction configured for {channel.mention}.", ephemeral=True)
 
 
+@bot.tree.command(name="autoreactchannelremove", description="Remove auto-reaction from a selected channel.")
+@app_commands.guild_only()
+@high_permission_only()
+async def autoreactchannelremove_command(interaction: discord.Interaction, channel: discord.TextChannel):
+    with db_connect() as db:
+        cursor = db.execute(
+            "DELETE FROM auto_react_channels WHERE guild_id = ? AND channel_id = ?",
+            (interaction.guild_id, channel.id)
+        )
+        db.commit()
+
+    if cursor.rowcount:
+        await interaction.response.send_message(
+            f"Auto-reaction removed from {channel.mention}.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"There is no auto-reaction configured for {channel.mention}.",
+            ephemeral=True
+        )
+
+
 @bot.tree.command(name="targetplayerreact", description="React whenever a selected member sends a message.")
 @app_commands.guild_only()
 @high_permission_only()
