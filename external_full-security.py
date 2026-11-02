@@ -6142,6 +6142,57 @@ async def givemeallrole_prefix(ctx, *, namerole: str):
     await ctx.reply(f"Assigned {role.mention} to you.")
 
 
+# ============================================================
+# OWNER-ONLY SHOW ALL CHANNELS GUIDE
+# Prefix command: ,show
+# This command cannot change a member's personal Discord UI settings.
+# ============================================================
+
+class ShowAllChannelsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(
+        label="Show All Channels - Instructions",
+        style=discord.ButtonStyle.primary,
+        custom_id="external_show_all_channels_instructions"
+    )
+    async def show_all_channels_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "To display all available channels, open this server's channel list, "
+            "select **Channels & Roles** or **Browse Channels** (the wording can "
+            "vary by Discord version), then choose **Show All Channels**. "
+            "This is a personal Discord setting, so each member must enable it "
+            "in their own Discord app. The bot cannot switch it on automatically.",
+            ephemeral=True
+        )
+
+
+@bot.command(name="show")
+async def show_channels_prefix(ctx):
+    if not is_bot_owner(ctx.author.id):
+        await ctx.reply("Only the bot owner can use this command.", mention_author=False)
+        return
+
+    if ctx.guild is None:
+        await ctx.reply("Use this command inside a server.", mention_author=False)
+        return
+
+    message = (
+        "**SHOW ALL CHANNELS**\n\n"
+        "Some channels may not appear in your channel list until you enable "
+        "the Show All Channels option.\n\n"
+        "Press the button below to see where to find this setting. "
+        "Each member needs to enable it on their own Discord account; "
+        "the bot cannot change a member's personal channel display settings."
+    )
+    await ctx.send(message, view=ShowAllChannelsView())
+
+
 @bot.command(name="kickbot")
 async def kickbot_prefix(ctx, *, target: str):
     if ctx.guild is None or not is_high_authorized(ctx.guild, ctx.author.id):
