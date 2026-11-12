@@ -17,7 +17,7 @@ BOT_NAME = "NOVASTRAP"
 BOT_VERSION = "1.0.0"
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = os.getenv("NOVASTRAP_DB", "novastrap.db")
-OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0"))  # Your Discord user ID
+OWNER_ID = int(os.getenv("1460495693536825479", "0"))  # Your Discord user ID
 
 logging.basicConfig(
     level=logging.INFO,
