@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 BOT_NAME = "ASIANTRXPZ"
-BOT_VERSION = "1.0.0"
+BOT_VERSION = "2.0.0"
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = os.getenv("ASIANTRXPZ_DB", "asiantrxpz.db")
@@ -477,7 +477,6 @@ async def on_message(message):
     cfg = config(message.guild.id)
     member = message.author
     if not is_exempt(member):
-        # Anti-spam
         if cfg["antispam_enabled"]:
             key = (message.guild.id, member.id)
             now = time.time()
@@ -500,7 +499,6 @@ async def on_message(message):
                 q.clear()
                 return
 
-        # Anti-link
         if cfg["antilink_enabled"] and re.search(
             r"(https?://|discord\.gg/|www\.)", message.content, re.I
         ):
@@ -514,7 +512,6 @@ async def on_message(message):
                 )
             return
 
-        # Anti-mention
         if cfg["antimention_enabled"] and len(message.mentions) >= cfg["antimention_limit"]:
             try:
                 await message.delete()
@@ -525,7 +522,6 @@ async def on_message(message):
             )
             return
 
-        # Anti-NSFW (text pattern only)
         if cfg["antinsfw_enabled"] and re.search(
             r"\b(nudes?|porn|xxx|onlyfans)\b", message.content, re.I
         ):
@@ -540,7 +536,6 @@ async def on_message(message):
                 )
             return
 
-        # XP
         if cfg["level_enabled"]:
             now = time.time()
             key = (message.guild.id, member.id)
@@ -563,7 +558,6 @@ async def on_message(message):
                         f"{member.mention} reached level **{level}**!"
                     )
 
-        # Autoresponders
         for item in db_all(
             "SELECT trigger,response FROM autoresponders WHERE guild_id=?",
             (message.guild.id,),
@@ -614,6 +608,7 @@ async def userinfo(interaction: discord.Interaction, member: discord.Member = No
         return
     if not await require_access(interaction, "userinfo"):
         return
+    await interaction.response.defer()
     member = member or interaction.user
     embed = discord.Embed(
         title=f"User Information — {member}", color=discord.Color.blurple()
@@ -633,7 +628,7 @@ async def userinfo(interaction: discord.Interaction, member: discord.Member = No
         )
     embed.add_field(name="Top Role", value=member.top_role.mention, inline=True)
     embed.add_field(name="Bot", value="Yes" if member.bot else "No", inline=True)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="serverinfo", description="View server information")
@@ -642,6 +637,7 @@ async def serverinfo(interaction: discord.Interaction):
         return
     if not await require_access(interaction, "serverinfo"):
         return
+    await interaction.response.defer()
     g = interaction.guild
     embed = discord.Embed(
         title=f"Server Information — {g.name}", color=discord.Color.blurple()
@@ -658,29 +654,35 @@ async def serverinfo(interaction: discord.Interaction):
         value=discord.utils.format_dt(g.created_at, "D"),
         inline=True,
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="avatar", description="Show a member's avatar")
 async def avatar(interaction: discord.Interaction, member: discord.Member = None):
     if not await require_access(interaction, "avatar"):
         return
+    await interaction.response.defer()
     member = member or interaction.user
     embed = discord.Embed(
         title=f"{member}'s Avatar", color=discord.Color.blurple()
     )
     embed.set_image(url=member.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="banner", description="Show a member's profile banner")
 async def banner(interaction: discord.Interaction, user: discord.User = None):
     if not await require_access(interaction, "banner"):
         return
+    await interaction.response.defer()
     user = user or interaction.user
-    user = await bot.fetch_user(user.id)
+    try:
+        user = await bot.fetch_user(user.id)
+    except discord.HTTPException:
+        await interaction.followup.send("Could not fetch that user.", ephemeral=True)
+        return
     if not user.banner:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This user has no public banner.", ephemeral=True
         )
         return
@@ -688,7 +690,7 @@ async def banner(interaction: discord.Interaction, user: discord.User = None):
         title=f"{user}'s Banner", color=discord.Color.blurple()
     )
     embed.set_image(url=user.banner.url)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 # ------------------------------ MODERATION ------------------------------
@@ -702,8 +704,9 @@ async def kick(
 ):
     if not await require_access(interaction, "kick"):
         return
+    await interaction.response.defer()
     if member.id == interaction.user.id or member.guild_permissions.administrator:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "That member cannot be kicked with this command.", ephemeral=True
         )
         return
@@ -711,12 +714,18 @@ async def kick(
         member.top_role >= interaction.user.top_role
         and interaction.user.id != interaction.guild.owner_id
     ):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Your role must be higher than the target's role.", ephemeral=True
         )
         return
-    await member.kick(reason=f"{reason} | Moderator: {interaction.user}")
-    await interaction.response.send_message(
+    try:
+        await member.kick(reason=f"{reason} | Moderator: {interaction.user}")
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to kick that member.", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
         f"**{member}** was kicked. Reason: {reason}"
     )
     await send_log(
@@ -735,8 +744,9 @@ async def ban(
 ):
     if not await require_access(interaction, "ban"):
         return
+    await interaction.response.defer()
     if member.id == interaction.user.id or member.guild_permissions.administrator:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "That member cannot be banned with this command.", ephemeral=True
         )
         return
@@ -744,15 +754,21 @@ async def ban(
         member.top_role >= interaction.user.top_role
         and interaction.user.id != interaction.guild.owner_id
     ):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Your role must be higher than the target's role.", ephemeral=True
         )
         return
-    await member.ban(
-        reason=f"{reason} | Moderator: {interaction.user}",
-        delete_message_seconds=0,
-    )
-    await interaction.response.send_message(
+    try:
+        await member.ban(
+            reason=f"{reason} | Moderator: {interaction.user}",
+            delete_message_seconds=0,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to ban that member.", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
         f"**{member}** was banned. Reason: {reason}"
     )
     await send_log(
@@ -774,19 +790,26 @@ async def timeout_cmd(
 ):
     if not await require_access(interaction, "timeout"):
         return
+    await interaction.response.defer()
     if (
         member.top_role >= interaction.user.top_role
         and interaction.user.id != interaction.guild.owner_id
     ):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Your role must be higher than the target's role.", ephemeral=True
         )
         return
-    await member.timeout(
-        timedelta(minutes=minutes),
-        reason=f"{reason} | Moderator: {interaction.user}",
-    )
-    await interaction.response.send_message(
+    try:
+        await member.timeout(
+            timedelta(minutes=minutes),
+            reason=f"{reason} | Moderator: {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to timeout that member.", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
         f"**{member}** timed out for {minutes} minutes. Reason: {reason}"
     )
     await send_log(
@@ -799,6 +822,7 @@ async def timeout_cmd(
 async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
     if not await require_access(interaction, "warn"):
         return
+    await interaction.response.defer()
     db_exec(
         "INSERT INTO warns VALUES(?,?,?,?,?)",
         (
@@ -813,7 +837,7 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
         "SELECT COUNT(*) AS n FROM warns WHERE guild_id=? AND user_id=?",
         (interaction.guild.id, member.id),
     )["n"]
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"{member.mention} has been warned. Total recorded warnings: **{count}**."
     )
     await send_log(
@@ -886,9 +910,10 @@ async def purgebot(
 async def server_ban_list(interaction: discord.Interaction):
     if not await require_access(interaction, "ban"):
         return
+    await interaction.response.defer(ephemeral=True)
     bans = [entry async for entry in interaction.guild.bans(limit=100)]
     if not bans:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "The server ban list is empty.", ephemeral=True
         )
         return
@@ -896,7 +921,7 @@ async def server_ban_list(interaction: discord.Interaction):
         f"{i + 1}. {entry.user} (`{entry.user.id}`)"
         for i, entry in enumerate(bans[:50])
     ]
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "**Server Ban List**\n" + "\n".join(lines), ephemeral=True
     )
 
@@ -909,12 +934,13 @@ async def all_logs_channel(
 ):
     if not await require_access(interaction, "all_logs_channel"):
         return
+    await interaction.response.defer(ephemeral=True)
     ensure_guild(interaction.guild.id)
     db_exec(
         "UPDATE guild_config SET log_channel_id=? WHERE guild_id=?",
         (channel.id, interaction.guild.id),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"All logs will be sent to {channel.mention}.", ephemeral=True
     )
 
@@ -931,11 +957,12 @@ async def advanced_logs(
 ):
     if not await require_access(interaction, "advanced_logs"):
         return
+    await interaction.response.defer(ephemeral=True)
     db_exec(
         "UPDATE guild_config SET advanced_logs=? WHERE guild_id=?",
         (1 if state.value == "on" else 0, interaction.guild.id),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Advanced logs: **{state.value.upper()}**", ephemeral=True
     )
 
@@ -957,6 +984,7 @@ async def antinuke(
 ):
     if not await require_access(interaction, "antinuke"):
         return
+    await interaction.response.defer(ephemeral=True)
     db_exec(
         """UPDATE guild_config SET antinuke_enabled=?, antinuke_action=?,
            antinuke_limit=?, antinuke_window=? WHERE guild_id=?""",
@@ -968,7 +996,7 @@ async def antinuke(
             interaction.guild.id,
         ),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Anti-nuke **{'enabled' if enabled else 'disabled'}**. "
         f"Threshold: {limit} actions / {window_seconds}s. "
         f"Punishment: {(action.value if action else 'timeout').upper()}.",
@@ -994,6 +1022,7 @@ async def antinuke_whitelist(
 ):
     if not await require_access(interaction, "antinuke"):
         return
+    await interaction.response.defer(ephemeral=True)
     gid = interaction.guild.id
     if operation.value == "list":
         rows = db_all(
@@ -1003,10 +1032,10 @@ async def antinuke_whitelist(
         text = "\n".join(
             f"<@{r['target_id']}> — {r['target_type']}" for r in rows
         ) or "Whitelist is empty."
-        await interaction.response.send_message(text, ephemeral=True)
+        await interaction.followup.send(text, ephemeral=True)
         return
     if user is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Select a user or bot.", ephemeral=True
         )
         return
@@ -1020,7 +1049,7 @@ async def antinuke_whitelist(
             "DELETE FROM antinuke_whitelist WHERE guild_id=? AND target_id=?",
             (gid, user.id),
         )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Anti-nuke whitelist updated for {user.mention}.", ephemeral=True
     )
 
@@ -1042,6 +1071,7 @@ async def antispam(
 ):
     if not await require_access(interaction, "antispam"):
         return
+    await interaction.response.defer(ephemeral=True)
     db_exec(
         """UPDATE guild_config SET antispam_enabled=?, antispam_action=?,
            antispam_limit=?, antispam_window=? WHERE guild_id=?""",
@@ -1053,7 +1083,7 @@ async def antispam(
             interaction.guild.id,
         ),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Anti-spam configuration saved.", ephemeral=True
     )
 
@@ -1074,11 +1104,12 @@ async def anti_link(
 ):
     if not await require_access(interaction, "anti_link"):
         return
+    await interaction.response.defer(ephemeral=True)
     db_exec(
         "UPDATE guild_config SET antilink_enabled=?, antilink_action=? WHERE guild_id=?",
         (int(enabled), action.value if action else "delete", interaction.guild.id),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Anti-link configuration saved.", ephemeral=True
     )
 
@@ -1099,6 +1130,7 @@ async def anti_mention(
 ):
     if not await require_access(interaction, "anti_mention"):
         return
+    await interaction.response.defer(ephemeral=True)
     db_exec(
         "UPDATE guild_config SET antimention_enabled=?, antimention_action=?, antimention_limit=? WHERE guild_id=?",
         (
@@ -1108,7 +1140,7 @@ async def anti_mention(
             interaction.guild.id,
         ),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Anti-mention configuration saved.", ephemeral=True
     )
 
@@ -1129,11 +1161,12 @@ async def anti_nsfw(
 ):
     if not await require_access(interaction, "anti_nsfw"):
         return
+    await interaction.response.defer(ephemeral=True)
     db_exec(
         "UPDATE guild_config SET antinsfw_enabled=?, antinsfw_action=? WHERE guild_id=?",
         (int(enabled), action.value if action else "delete", interaction.guild.id),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Anti-NSFW text filter configuration saved. Note: this is a basic "
         "text-pattern filter, not image/video detection.",
         ephemeral=True,
@@ -1167,6 +1200,7 @@ async def moderation_access(
 ):
     if not await require_access(interaction, "moderation_access"):
         return
+    await interaction.response.defer(ephemeral=True)
     gid = interaction.guild.id
     if operation.value == "list":
         rows = db_all(
@@ -1177,15 +1211,15 @@ async def moderation_access(
             "\n".join(f"<@{r['user_id']}> — **{r['level']}**" for r in rows)
             or "No staff entries."
         )
-        await interaction.response.send_message(body, ephemeral=True)
+        await interaction.followup.send(body, ephemeral=True)
         return
     if member is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Select a member.", ephemeral=True
         )
         return
     if member.id == interaction.guild.owner_id or is_owner(member.id):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "The server/bot owner access cannot be changed here.", ephemeral=True
         )
         return
@@ -1198,17 +1232,17 @@ async def moderation_access(
             "DELETE FROM access_commands WHERE guild_id=? AND user_id=?",
             (gid, member.id),
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Removed ASIANTRXPZ access for {member.mention}.", ephemeral=True
         )
         return
     if level is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Choose a level.", ephemeral=True
         )
         return
     if level.value == "HIGH" and not is_owner(interaction.user.id):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Only the configured ASIANTRXPZ bot owner can assign HIGH.",
             ephemeral=True,
         )
@@ -1218,7 +1252,7 @@ async def moderation_access(
            ON CONFLICT(guild_id,user_id) DO UPDATE SET level=excluded.level""",
         (gid, member.id, level.value),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"{member.mention} now has **{level.value}** access.", ephemeral=True
     )
     await send_log(
@@ -1247,18 +1281,19 @@ async def bypass_member(
 ):
     if not await require_access(interaction, "bypass"):
         return
+    await interaction.response.defer(ephemeral=True)
     gid = interaction.guild.id
     if operation.value == "list":
         rows = db_all(
             "SELECT user_id FROM bypass_members WHERE guild_id=?", (gid,)
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "\n".join(f"<@{r['user_id']}>" for r in rows) or "Empty.",
             ephemeral=True,
         )
         return
     if member is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Select a member.", ephemeral=True
         )
         return
@@ -1271,7 +1306,7 @@ async def bypass_member(
             "DELETE FROM bypass_members WHERE guild_id=? AND user_id=?",
             (gid, member.id),
         )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Bypass list updated.", ephemeral=True
     )
 
@@ -1293,18 +1328,19 @@ async def bypass_bot(
 ):
     if not await require_access(interaction, "bypass"):
         return
+    await interaction.response.defer(ephemeral=True)
     gid = interaction.guild.id
     if operation.value == "list":
         rows = db_all(
             "SELECT user_id FROM bypass_bots WHERE guild_id=?", (gid,)
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "\n".join(f"<@{r['user_id']}>" for r in rows) or "Empty.",
             ephemeral=True,
         )
         return
     if user is None or not user.bot:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Select a bot account.", ephemeral=True
         )
         return
@@ -1317,7 +1353,7 @@ async def bypass_bot(
             "DELETE FROM bypass_bots WHERE guild_id=? AND user_id=?",
             (gid, user.id),
         )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Bot bypass list updated.", ephemeral=True
     )
 
@@ -1345,15 +1381,16 @@ async def server_prem(
             ephemeral=True,
         )
         return
+    await interaction.response.defer(ephemeral=True)
     if operation.value == "list":
         rows = db_all("SELECT guild_id FROM guild_config WHERE premium=1")
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "\n".join(str(r["guild_id"]) for r in rows) or "No premium servers.",
             ephemeral=True,
         )
         return
     if not guild_id or not guild_id.isdigit():
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Provide a valid server ID.", ephemeral=True
         )
         return
@@ -1363,7 +1400,7 @@ async def server_prem(
         "UPDATE guild_config SET premium=? WHERE guild_id=?",
         (1 if operation.value == "add" else 0, gid),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Premium {operation.value} completed for server `{gid}`.", ephemeral=True
     )
 
@@ -1380,11 +1417,12 @@ async def setup_level(
 ):
     if not await require_access(interaction, "setup_level"):
         return
+    await interaction.response.defer(ephemeral=True)
     db_exec(
         "UPDATE guild_config SET level_enabled=?, level_channel_id=? WHERE guild_id=?",
         (int(enabled), channel.id if channel else None, interaction.guild.id),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Level system {'enabled' if enabled else 'disabled'}.", ephemeral=True
     )
 
@@ -1393,6 +1431,7 @@ async def setup_level(
 async def lb(interaction: discord.Interaction):
     if not await require_access(interaction, "leaderboard"):
         return
+    await interaction.response.defer()
     rows = db_all(
         "SELECT user_id,xp,level FROM levels WHERE guild_id=? ORDER BY xp DESC LIMIT 10",
         (interaction.guild.id,),
@@ -1404,7 +1443,7 @@ async def lb(interaction: discord.Interaction):
         )
         or "No XP data yet."
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=discord.Embed(
             title="ASIANTRXPZ Leaderboard",
             description=body,
@@ -1430,6 +1469,7 @@ async def xp_cmd(
 ):
     if not await require_access(interaction, "setup_level"):
         return
+    await interaction.response.defer(ephemeral=True)
     row = db_one(
         "SELECT xp FROM levels WHERE guild_id=? AND user_id=?",
         (interaction.guild.id, member.id),
@@ -1450,7 +1490,7 @@ async def xp_cmd(
            xp=excluded.xp, level=excluded.level""",
         (interaction.guild.id, member.id, value, level),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"{member.mention}: **{value} XP**, Level **{level}**.", ephemeral=True
     )
 
@@ -1477,6 +1517,7 @@ async def autoresponder(
 ):
     if not await require_access(interaction, "automod"):
         return
+    await interaction.response.defer(ephemeral=True)
     gid = interaction.guild.id
     if operation.value == "list":
         rows = db_all(
@@ -1488,10 +1529,10 @@ async def autoresponder(
             )
             or "No autoresponders."
         )
-        await interaction.response.send_message(body, ephemeral=True)
+        await interaction.followup.send(body, ephemeral=True)
         return
     if not trigger:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Provide a trigger phrase.", ephemeral=True
         )
         return
@@ -1500,12 +1541,12 @@ async def autoresponder(
             "DELETE FROM autoresponders WHERE guild_id=? AND trigger=?",
             (gid, trigger),
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Autoresponder removed.", ephemeral=True
         )
         return
     if not response_text:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Provide a response.", ephemeral=True
         )
         return
@@ -1514,7 +1555,7 @@ async def autoresponder(
            ON CONFLICT(guild_id,trigger) DO UPDATE SET response=excluded.response""",
         (gid, trigger, response_text),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Autoresponder saved.", ephemeral=True
     )
 
@@ -1525,13 +1566,16 @@ async def autoresponder(
 async def poll(interaction: discord.Interaction, question: str):
     if not await require_access(interaction, "poll"):
         return
+    await interaction.response.defer()
     embed = discord.Embed(
         title="Community Poll", description=question, color=discord.Color.blurple()
     )
-    await interaction.response.send_message(embed=embed)
-    msg = await interaction.original_response()
-    await msg.add_reaction("👍")
-    await msg.add_reaction("👎")
+    msg = await interaction.followup.send(embed=embed)
+    try:
+        await msg.add_reaction("👍")
+        await msg.add_reaction("👎")
+    except discord.HTTPException:
+        pass
 
 
 # ------------------------------ SNIPE ------------------------------
@@ -1540,13 +1584,14 @@ async def poll(interaction: discord.Interaction, question: str):
     name="snipe", description="Show the most recently deleted message in this channel"
 )
 async def snipe(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     item = snipes.get(interaction.channel_id)
     if not item:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No deleted message is cached.", ephemeral=True
         )
         return
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"**{item['author']}**: {item['content'][:1500]}", ephemeral=True
     )
 
@@ -1557,6 +1602,7 @@ async def snipe(interaction: discord.Interaction):
 async def save(interaction: discord.Interaction):
     if not await require_access(interaction, "backup"):
         return
+    await interaction.response.defer(ephemeral=True)
     g = interaction.guild
     payload = {
         "name": g.name,
@@ -1592,7 +1638,7 @@ async def save(interaction: discord.Interaction):
             datetime.now(timezone.utc).isoformat(),
         ),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Server structure snapshot saved. This is a configuration snapshot, "
         "not a full restore or member/message backup.",
         ephemeral=True,
@@ -1603,17 +1649,18 @@ async def save(interaction: discord.Interaction):
 async def backup(interaction: discord.Interaction):
     if not await require_access(interaction, "backup"):
         return
+    await interaction.response.defer(ephemeral=True)
     row = db_one(
         "SELECT payload,created_at FROM saved_backups WHERE guild_id=?",
         (interaction.guild.id,),
     )
     if not row:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No saved snapshot. Run /save first.", ephemeral=True
         )
         return
     data = json.loads(row["payload"])
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Snapshot saved: `{row['created_at']}`\n"
         f"Roles: **{len(data['roles'])}**\nCategories: **{len(data['categories'])}**\n"
         f"Channels: **{len(data['channels'])}**\n\n"
@@ -1633,15 +1680,18 @@ async def giveaway_create(
 ):
     if not await require_access(interaction, "giveaway"):
         return
+    await interaction.response.defer()
     ends = time.time() + duration_minutes * 60
     embed = discord.Embed(
         title="Giveaway",
         description=f"Prize: **{prize}**\nReact with 🎉 to enter.\nEnds <t:{int(ends)}:R>",
         color=discord.Color.gold(),
     )
-    await interaction.response.send_message(embed=embed)
-    msg = await interaction.original_response()
-    await msg.add_reaction("🎉")
+    msg = await interaction.followup.send(embed=embed)
+    try:
+        await msg.add_reaction("🎉")
+    except discord.HTTPException:
+        pass
     db_exec(
         "INSERT INTO giveaways(message_id,guild_id,channel_id,prize,ends_at) VALUES(?,?,?,?,?)",
         (msg.id, interaction.guild.id, interaction.channel_id, prize, ends),
@@ -1687,6 +1737,8 @@ async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ):
     log.exception("Application command error", exc_info=error)
+    if isinstance(error, discord.NotFound):
+        return
     message = (
         "The command failed. Check the bot logs and confirm the bot has the "
         "required Discord permissions."
