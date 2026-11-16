@@ -2,7 +2,6 @@ import os
 import re
 import json
 import time
-import asyncio
 import sqlite3
 import logging
 from datetime import datetime, timedelta, timezone
@@ -14,14 +13,14 @@ from discord.ext import commands, tasks
 
 BOT_NAME = "ASIANTRXPZ"
 BOT_VERSION = "1.0.0"
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = os.getenv("ASIANTRXPZ_DB", "asiantrxpz.db")
-# FIX: was reading env var named after the ID. Use a proper env var name.
 OWNER_ID = int(os.getenv("OWNER_ID", "1460495693536825479"))
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("asiantrxpz")
 
@@ -33,7 +32,6 @@ intents.guilds = True
 intents.members = True
 intents.messages = True
 intents.message_content = True
-# FIX: discord.Intents has no `.moderation` attribute -> removed (it caused AttributeError at startup)
 
 bot = commands.Bot(command_prefix=",", intents=intents, help_command=None)
 tree = bot.tree
@@ -42,18 +40,21 @@ tree = bot.tree
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
-db_lock = asyncio.Lock()
+
 
 def db_exec(sql, params=()):
     cur = db.execute(sql, params)
     db.commit()
     return cur
 
+
 def db_one(sql, params=()):
     return db.execute(sql, params).fetchone()
 
+
 def db_all(sql, params=()):
     return db.execute(sql, params).fetchall()
+
 
 def init_db():
     db.executescript("""
@@ -147,14 +148,18 @@ def init_db():
     """)
     db.commit()
 
+
 init_db()
+
 
 def ensure_guild(guild_id: int):
     db_exec("INSERT OR IGNORE INTO guild_config(guild_id) VALUES(?)", (guild_id,))
 
+
 def config(guild_id: int):
     ensure_guild(guild_id)
     return db_one("SELECT * FROM guild_config WHERE guild_id=?", (guild_id,))
+
 
 # ------------------------------ PERMISSIONS ------------------------------
 
@@ -172,13 +177,18 @@ COMMAND_LEVEL = {
     "help": "LOW", "poll": "LOW", "vote": "LOW", "leaderboard": "LOW",
 }
 
+
 def is_owner(user_id: int) -> bool:
     return OWNER_ID != 0 and user_id == OWNER_ID
 
+
 def get_level(guild_id: int, user_id: int) -> str:
-    row = db_one("SELECT level FROM access_levels WHERE guild_id=? AND user_id=?",
-                 (guild_id, user_id))
+    row = db_one(
+        "SELECT level FROM access_levels WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id),
+    )
     return row["level"] if row else "LOW"
+
 
 def has_access(interaction: discord.Interaction, command_key: str) -> bool:
     if interaction.guild is None:
@@ -193,9 +203,10 @@ def has_access(interaction: discord.Interaction, command_key: str) -> bool:
         return False
     row = db_one(
         "SELECT allowed FROM access_commands WHERE guild_id=? AND user_id=? AND command=?",
-        (interaction.guild.id, interaction.user.id, command_key)
+        (interaction.guild.id, interaction.user.id, command_key),
     )
     return row is None or bool(row["allowed"])
+
 
 async def require_access(interaction: discord.Interaction, command_key: str) -> bool:
     if not has_access(interaction, command_key):
@@ -205,6 +216,7 @@ async def require_access(interaction: discord.Interaction, command_key: str) -> 
         return False
     return True
 
+
 async def require_guild(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
         await interaction.response.send_message(
@@ -212,6 +224,7 @@ async def require_guild(interaction: discord.Interaction) -> bool:
         )
         return False
     return True
+
 
 # ------------------------------ LOGGING ------------------------------
 
@@ -223,13 +236,18 @@ async def send_log(guild: discord.Guild, title: str, description: str,
     channel = guild.get_channel(cfg["log_channel_id"])
     if channel is None:
         return
-    embed = discord.Embed(title=title, description=description[:4000],
-                          color=color, timestamp=discord.utils.utcnow())
+    embed = discord.Embed(
+        title=title,
+        description=description[:4000],
+        color=color,
+        timestamp=discord.utils.utcnow(),
+    )
     embed.set_footer(text=f"{BOT_NAME} | {BOT_VERSION}")
     try:
         await channel.send(embed=embed)
     except discord.Forbidden:
         log.warning("Missing permission to send logs in guild %s", guild.id)
+
 
 async def audit_actor(guild: discord.Guild, action: discord.AuditLogAction, target_id: int):
     try:
@@ -240,6 +258,7 @@ async def audit_actor(guild: discord.Guild, action: discord.AuditLogAction, targ
     except (discord.Forbidden, discord.HTTPException):
         pass
     return None
+
 
 # ------------------------------ MODERATION HELPERS ------------------------------
 
@@ -258,31 +277,38 @@ async def punish_member(member: discord.Member, action: str, reason: str):
     except discord.HTTPException as exc:
         log.warning("Punishment failed: %s", exc)
 
+
 def is_exempt(member: discord.Member) -> bool:
     if member.guild.owner_id == member.id or is_owner(member.id):
         return True
     if member.guild_permissions.administrator:
         return True
-    if db_one("SELECT 1 FROM bypass_members WHERE guild_id=? AND user_id=?",
-              (member.guild.id, member.id)):
+    if db_one(
+        "SELECT 1 FROM bypass_members WHERE guild_id=? AND user_id=?",
+        (member.guild.id, member.id),
+    ):
         return True
     return False
+
 
 spam_cache = defaultdict(lambda: deque(maxlen=30))
 nuke_cache = defaultdict(lambda: deque(maxlen=30))
 xp_cooldown = {}
-
-# FIX: moved `snipes` here so on_message_delete never references an undefined name.
 snipes = {}
+
 
 async def security_check(member: discord.Member, reason: str, action: str):
     if is_exempt(member):
         return
     await punish_member(member, action, reason)
-    await send_log(member.guild, "Security Alert",
-                   f"**Member:** {member.mention} (`{member.id}`)\n"
-                   f"**Detection:** {reason}\n**Action:** {action.upper()}",
-                   discord.Color.red())
+    await send_log(
+        member.guild,
+        "Security Alert",
+        f"**Member:** {member.mention} (`{member.id}`)\n"
+        f"**Detection:** {reason}\n**Action:** {action.upper()}",
+        discord.Color.red(),
+    )
+
 
 # ------------------------------ BASIC EVENTS ------------------------------
 
@@ -297,92 +323,126 @@ async def on_ready():
     if not giveaway_worker.is_running():
         giveaway_worker.start()
 
+
 @bot.event
 async def on_guild_join(guild):
     ensure_guild(guild.id)
     await send_log(guild, "Bot Joined", f"Joined **{guild.name}** (`{guild.id}`).")
 
+
 @bot.event
 async def on_member_join(member):
-    await send_log(member.guild, "Member Joined",
-                   f"{member.mention} (`{member.id}`) joined the server.")
+    await send_log(
+        member.guild, "Member Joined",
+        f"{member.mention} (`{member.id}`) joined the server.",
+    )
+
 
 @bot.event
 async def on_member_remove(member):
-    await send_log(member.guild, "Member Left",
-                   f"**{member}** (`{member.id}`) left the server.")
+    await send_log(
+        member.guild, "Member Left",
+        f"**{member}** (`{member.id}`) left the server.",
+    )
+
 
 @bot.event
 async def on_member_ban(guild, user):
     await send_log(guild, "Member Banned", f"**{user}** (`{user.id}`) was banned.")
 
+
 @bot.event
 async def on_member_unban(guild, user):
     await send_log(guild, "Member Unbanned", f"**{user}** (`{user.id}`) was unbanned.")
+
 
 @bot.event
 async def on_message_delete(message):
     if message.guild and not message.author.bot:
         snipes[message.channel.id] = {
             "author": str(message.author),
-            "content": message.content or "[No text content]"
+            "content": message.content or "[No text content]",
         }
         content = message.content[:1500] if message.content else "[No text content]"
-        await send_log(message.guild, "Message Deleted",
-                       f"**Author:** {message.author} (`{message.author.id}`)\n"
-                       f"**Channel:** {message.channel.mention}\n"
-                       f"**Content:** {discord.utils.escape_markdown(content)}")
+        await send_log(
+            message.guild, "Message Deleted",
+            f"**Author:** {message.author} (`{message.author.id}`)\n"
+            f"**Channel:** {message.channel.mention}\n"
+            f"**Content:** {discord.utils.escape_markdown(content)}",
+        )
+
 
 @bot.event
 async def on_message_edit(before, after):
     if before.guild and not before.author.bot and before.content != after.content:
-        await send_log(before.guild, "Message Edited",
-                       f"**Author:** {before.author} (`{before.author.id}`)\n"
-                       f"**Channel:** {before.channel.mention}\n"
-                       f"**Before:** {before.content[:900] or '[empty]'}\n"
-                       f"**After:** {after.content[:900] or '[empty]'}")
+        await send_log(
+            before.guild, "Message Edited",
+            f"**Author:** {before.author} (`{before.author.id}`)\n"
+            f"**Channel:** {before.channel.mention}\n"
+            f"**Before:** {before.content[:900] or '[empty]'}\n"
+            f"**After:** {after.content[:900] or '[empty]'}",
+        )
+
 
 @bot.event
 async def on_guild_channel_create(channel):
     actor = await audit_actor(channel.guild, discord.AuditLogAction.channel_create, channel.id)
-    await send_log(channel.guild, "Channel Created",
-                   f"**Channel:** {channel.mention}\n**Created by:** {actor or 'Unknown'}")
+    await send_log(
+        channel.guild, "Channel Created",
+        f"**Channel:** {channel.mention}\n**Created by:** {actor or 'Unknown'}",
+    )
     await nuke_guard(channel.guild, actor, "Created a channel")
+
 
 @bot.event
 async def on_guild_channel_delete(channel):
     actor = await audit_actor(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
-    await send_log(channel.guild, "Channel Deleted",
-                   f"**Channel:** {channel.name} (`{channel.id}`)\n**Deleted by:** {actor or 'Unknown'}")
+    await send_log(
+        channel.guild, "Channel Deleted",
+        f"**Channel:** {channel.name} (`{channel.id}`)\n**Deleted by:** {actor or 'Unknown'}",
+    )
     await nuke_guard(channel.guild, actor, "Deleted a channel")
+
 
 @bot.event
 async def on_guild_channel_update(before, after):
     actor = await audit_actor(after.guild, discord.AuditLogAction.channel_update, after.id)
-    await send_log(after.guild, "Channel Updated",
-                   f"**Channel:** {after.mention}\n**Updated by:** {actor or 'Unknown'}")
+    await send_log(
+        after.guild, "Channel Updated",
+        f"**Channel:** {after.mention}\n**Updated by:** {actor or 'Unknown'}",
+    )
     await nuke_guard(after.guild, actor, "Updated a channel")
+
 
 @bot.event
 async def on_guild_role_create(role):
     actor = await audit_actor(role.guild, discord.AuditLogAction.role_create, role.id)
-    await send_log(role.guild, "Role Created",
-                   f"**Role:** {role.name} (`{role.id}`)\n**Created by:** {actor or 'Unknown'}")
+    await send_log(
+        role.guild, "Role Created",
+        f"**Role:** {role.name} (`{role.id}`)\n**Created by:** {actor or 'Unknown'}",
+    )
     await nuke_guard(role.guild, actor, "Created a role")
+
 
 @bot.event
 async def on_guild_role_delete(role):
     actor = await audit_actor(role.guild, discord.AuditLogAction.role_delete, role.id)
-    await send_log(role.guild, "Role Deleted",
-                   f"**Role:** {role.name} (`{role.id}`)\n**Deleted by:** {actor or 'Unknown'}")
+    await send_log(
+        role.guild, "Role Deleted",
+        f"**Role:** {role.name} (`{role.id}`)\n**Deleted by:** {actor or 'Unknown'}",
+    )
     await nuke_guard(role.guild, actor, "Deleted a role")
+
 
 @bot.event
 async def on_guild_role_update(before, after):
     actor = await audit_actor(after.guild, discord.AuditLogAction.role_update, after.id)
-    await send_log(after.guild, "Role Updated",
-                   f"**Role:** {after.name}\n**Updated by:** {actor or 'Unknown'}")
+    await send_log(
+        after.guild, "Role Updated",
+        f"**Role:** {after.name}\n**Updated by:** {actor or 'Unknown'}",
+    )
     await nuke_guard(after.guild, actor, "Updated a role")
+
 
 async def nuke_guard(guild, actor, reason):
     if actor is None or not isinstance(actor, discord.Member) or is_exempt(actor):
@@ -390,8 +450,10 @@ async def nuke_guard(guild, actor, reason):
     cfg = config(guild.id)
     if not cfg["antinuke_enabled"]:
         return
-    if db_one("SELECT 1 FROM antinuke_whitelist WHERE guild_id=? AND target_id=?",
-              (guild.id, actor.id)):
+    if db_one(
+        "SELECT 1 FROM antinuke_whitelist WHERE guild_id=? AND target_id=?",
+        (guild.id, actor.id),
+    ):
         return
     now = time.time()
     key = (guild.id, actor.id)
@@ -400,9 +462,13 @@ async def nuke_guard(guild, actor, reason):
     while q and now - q[0] > cfg["antinuke_window"]:
         q.popleft()
     if len(q) >= cfg["antinuke_limit"]:
-        await security_check(actor, f"Anti-nuke: {reason} ({len(q)} actions)",
-                             cfg["antinuke_action"])
+        await security_check(
+            actor,
+            f"Anti-nuke: {reason} ({len(q)} actions)",
+            cfg["antinuke_action"],
+        )
         q.clear()
+
 
 @bot.event
 async def on_message(message):
@@ -411,6 +477,7 @@ async def on_message(message):
     cfg = config(message.guild.id)
     member = message.author
     if not is_exempt(member):
+        # Anti-spam
         if cfg["antispam_enabled"]:
             key = (message.guild.id, member.id)
             now = time.time()
@@ -422,31 +489,43 @@ async def on_message(message):
                 try:
                     await message.channel.purge(
                         limit=min(len(q), 30),
-                        check=lambda m: m.author.id == member.id
+                        check=lambda m: m.author.id == member.id,
                     )
                 except discord.HTTPException:
                     pass
-                await security_check(member, "Anti-spam message limit exceeded",
-                                     cfg["antispam_action"])
+                await security_check(
+                    member, "Anti-spam message limit exceeded",
+                    cfg["antispam_action"],
+                )
                 q.clear()
                 return
-        if cfg["antilink_enabled"] and re.search(r"(https?://|discord\.gg/|www\.)", message.content, re.I):
+
+        # Anti-link
+        if cfg["antilink_enabled"] and re.search(
+            r"(https?://|discord\.gg/|www\.)", message.content, re.I
+        ):
             try:
                 await message.delete()
             except discord.HTTPException:
                 pass
             if cfg["antilink_action"] != "delete":
-                await security_check(member, "Posted a prohibited link",
-                                     cfg["antilink_action"])
+                await security_check(
+                    member, "Posted a prohibited link", cfg["antilink_action"]
+                )
             return
+
+        # Anti-mention
         if cfg["antimention_enabled"] and len(message.mentions) >= cfg["antimention_limit"]:
             try:
                 await message.delete()
             except discord.HTTPException:
                 pass
-            await security_check(member, "Mention limit exceeded",
-                                 cfg["antimention_action"])
+            await security_check(
+                member, "Mention limit exceeded", cfg["antimention_action"]
+            )
             return
+
+        # Anti-NSFW (text pattern only)
         if cfg["antinsfw_enabled"] and re.search(
             r"\b(nudes?|porn|xxx|onlyfans)\b", message.content, re.I
         ):
@@ -455,149 +534,305 @@ async def on_message(message):
             except discord.HTTPException:
                 pass
             if cfg["antinsfw_action"] != "delete":
-                await security_check(member, "Prohibited NSFW-related text detected",
-                                     cfg["antinsfw_action"])
+                await security_check(
+                    member, "Prohibited NSFW-related text detected",
+                    cfg["antinsfw_action"],
+                )
             return
 
+        # XP
         if cfg["level_enabled"]:
             now = time.time()
             key = (message.guild.id, member.id)
             if now - xp_cooldown.get(key, 0) >= 60:
                 xp_cooldown[key] = now
-                row = db_one("SELECT xp, level FROM levels WHERE guild_id=? AND user_id=?",
-                             (message.guild.id, member.id))
+                row = db_one(
+                    "SELECT xp, level FROM levels WHERE guild_id=? AND user_id=?",
+                    (message.guild.id, member.id),
+                )
                 xp = (row["xp"] if row else 0) + 15
                 level = int((xp / 100) ** 0.5)
-                db_exec("""INSERT INTO levels(guild_id,user_id,xp,level) VALUES(?,?,?,?)
-                           ON CONFLICT(guild_id,user_id) DO UPDATE SET xp=excluded.xp, level=excluded.level""",
-                        (message.guild.id, member.id, xp, level))
+                db_exec(
+                    """INSERT INTO levels(guild_id,user_id,xp,level) VALUES(?,?,?,?)
+                       ON CONFLICT(guild_id,user_id) DO UPDATE SET
+                       xp=excluded.xp, level=excluded.level""",
+                    (message.guild.id, member.id, xp, level),
+                )
                 if row and level > row["level"]:
-                    await message.channel.send(f"{member.mention} reached level **{level}**!")
+                    await message.channel.send(
+                        f"{member.mention} reached level **{level}**!"
+                    )
 
-        for item in db_all("SELECT trigger,response FROM autoresponders WHERE guild_id=?",
-                           (message.guild.id,)):
+        # Autoresponders
+        for item in db_all(
+            "SELECT trigger,response FROM autoresponders WHERE guild_id=?",
+            (message.guild.id,),
+        ):
             if message.content.lower() == item["trigger"].lower():
                 await message.channel.send(item["response"])
                 break
+
     await bot.process_commands(message)
+
 
 # ------------------------------ HELP / INFO ------------------------------
 
 @tree.command(name="help", description="Show ASIANTRXPZ commands and permission levels")
 async def help_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(title="ASIANTRXPZ | Command Center",
+    embed = discord.Embed(
+        title="ASIANTRXPZ | Command Center",
         description="Advanced Server Security — One System. Total Control.",
-        color=discord.Color.blurple())
-    embed.add_field(name="HIGH", value="Security settings, access control, backups, server configuration.", inline=False)
-    embed.add_field(name="MEDIUM", value="Kick, ban, timeout, warn, purge, jail and lock management.", inline=False)
-    embed.add_field(name="LOW", value="User/server info, avatar, banner, help and basic utilities.", inline=False)
-    embed.add_field(name="Prefix", value="`,` (legacy prefix commands are not enabled in this release).", inline=False)
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="HIGH",
+        value="Security settings, access control, backups, server configuration.",
+        inline=False,
+    )
+    embed.add_field(
+        name="MEDIUM",
+        value="Kick, ban, timeout, warn, purge, jail and lock management.",
+        inline=False,
+    )
+    embed.add_field(
+        name="LOW",
+        value="User/server info, avatar, banner, help and basic utilities.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Prefix",
+        value="`,` (legacy prefix commands are not enabled in this release).",
+        inline=False,
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 @tree.command(name="userinfo", description="View information about a server member")
 @app_commands.describe(member="Member to inspect")
 async def userinfo(interaction: discord.Interaction, member: discord.Member = None):
-    if not await require_guild(interaction): return
-    if not await require_access(interaction, "userinfo"): return
+    if not await require_guild(interaction):
+        return
+    if not await require_access(interaction, "userinfo"):
+        return
     member = member or interaction.user
-    embed = discord.Embed(title=f"User Information — {member}",
-                          color=discord.Color.blurple())
+    embed = discord.Embed(
+        title=f"User Information — {member}", color=discord.Color.blurple()
+    )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="User ID", value=str(member.id), inline=True)
-    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "D"), inline=True)
+    embed.add_field(
+        name="Account Created",
+        value=discord.utils.format_dt(member.created_at, "D"),
+        inline=True,
+    )
     if member.joined_at:
-        embed.add_field(name="Joined Server", value=discord.utils.format_dt(member.joined_at, "D"), inline=True)
+        embed.add_field(
+            name="Joined Server",
+            value=discord.utils.format_dt(member.joined_at, "D"),
+            inline=True,
+        )
     embed.add_field(name="Top Role", value=member.top_role.mention, inline=True)
     embed.add_field(name="Bot", value="Yes" if member.bot else "No", inline=True)
     await interaction.response.send_message(embed=embed)
 
+
 @tree.command(name="serverinfo", description="View server information")
 async def serverinfo(interaction: discord.Interaction):
-    if not await require_guild(interaction): return
-    if not await require_access(interaction, "serverinfo"): return
+    if not await require_guild(interaction):
+        return
+    if not await require_access(interaction, "serverinfo"):
+        return
     g = interaction.guild
-    embed = discord.Embed(title=f"Server Information — {g.name}",
-                          color=discord.Color.blurple())
-    if g.icon: embed.set_thumbnail(url=g.icon.url)
+    embed = discord.Embed(
+        title=f"Server Information — {g.name}", color=discord.Color.blurple()
+    )
+    if g.icon:
+        embed.set_thumbnail(url=g.icon.url)
     embed.add_field(name="Server ID", value=str(g.id), inline=True)
     embed.add_field(name="Owner", value=f"<@{g.owner_id}>", inline=True)
     embed.add_field(name="Members", value=str(g.member_count), inline=True)
     embed.add_field(name="Roles", value=str(len(g.roles)), inline=True)
     embed.add_field(name="Channels", value=str(len(g.channels)), inline=True)
-    embed.add_field(name="Created", value=discord.utils.format_dt(g.created_at, "D"), inline=True)
+    embed.add_field(
+        name="Created",
+        value=discord.utils.format_dt(g.created_at, "D"),
+        inline=True,
+    )
     await interaction.response.send_message(embed=embed)
+
 
 @tree.command(name="avatar", description="Show a member's avatar")
 async def avatar(interaction: discord.Interaction, member: discord.Member = None):
-    if not await require_access(interaction, "avatar"): return
+    if not await require_access(interaction, "avatar"):
+        return
     member = member or interaction.user
-    embed = discord.Embed(title=f"{member}'s Avatar", color=discord.Color.blurple())
+    embed = discord.Embed(
+        title=f"{member}'s Avatar", color=discord.Color.blurple()
+    )
     embed.set_image(url=member.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
+
 @tree.command(name="banner", description="Show a member's profile banner")
 async def banner(interaction: discord.Interaction, user: discord.User = None):
-    if not await require_access(interaction, "banner"): return
+    if not await require_access(interaction, "banner"):
+        return
     user = user or interaction.user
     user = await bot.fetch_user(user.id)
     if not user.banner:
-        await interaction.response.send_message("This user has no public banner.", ephemeral=True)
+        await interaction.response.send_message(
+            "This user has no public banner.", ephemeral=True
+        )
         return
-    embed = discord.Embed(title=f"{user}'s Banner", color=discord.Color.blurple())
+    embed = discord.Embed(
+        title=f"{user}'s Banner", color=discord.Color.blurple()
+    )
     embed.set_image(url=user.banner.url)
     await interaction.response.send_message(embed=embed)
+
 
 # ------------------------------ MODERATION ------------------------------
 
 @tree.command(name="kick", description="Kick a member from this server")
 @app_commands.describe(member="Member to kick", reason="Reason for the kick")
-async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-    if not await require_access(interaction, "kick"): return
+async def kick(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+):
+    if not await require_access(interaction, "kick"):
+        return
     if member.id == interaction.user.id or member.guild_permissions.administrator:
-        await interaction.response.send_message("That member cannot be kicked with this command.", ephemeral=True); return
-    if member.top_role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message("Your role must be higher than the target's role.", ephemeral=True); return
+        await interaction.response.send_message(
+            "That member cannot be kicked with this command.", ephemeral=True
+        )
+        return
+    if (
+        member.top_role >= interaction.user.top_role
+        and interaction.user.id != interaction.guild.owner_id
+    ):
+        await interaction.response.send_message(
+            "Your role must be higher than the target's role.", ephemeral=True
+        )
+        return
     await member.kick(reason=f"{reason} | Moderator: {interaction.user}")
-    await interaction.response.send_message(f"**{member}** was kicked. Reason: {reason}")
-    await send_log(interaction.guild, "Member Kicked", f"**Target:** {member} (`{member.id}`)\n**Moderator:** {interaction.user}\n**Reason:** {reason}")
+    await interaction.response.send_message(
+        f"**{member}** was kicked. Reason: {reason}"
+    )
+    await send_log(
+        interaction.guild, "Member Kicked",
+        f"**Target:** {member} (`{member.id}`)\n"
+        f"**Moderator:** {interaction.user}\n**Reason:** {reason}",
+    )
+
 
 @tree.command(name="ban", description="Ban a member from this server")
 @app_commands.describe(member="Member to ban", reason="Reason for the ban")
-async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-    if not await require_access(interaction, "ban"): return
+async def ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+):
+    if not await require_access(interaction, "ban"):
+        return
     if member.id == interaction.user.id or member.guild_permissions.administrator:
-        await interaction.response.send_message("That member cannot be banned with this command.", ephemeral=True); return
-    if member.top_role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message("Your role must be higher than the target's role.", ephemeral=True); return
-    await member.ban(reason=f"{reason} | Moderator: {interaction.user}", delete_message_seconds=0)
-    await interaction.response.send_message(f"**{member}** was banned. Reason: {reason}")
-    await send_log(interaction.guild, "Member Banned", f"**Target:** {member} (`{member.id}`)\n**Moderator:** {interaction.user}\n**Reason:** {reason}")
+        await interaction.response.send_message(
+            "That member cannot be banned with this command.", ephemeral=True
+        )
+        return
+    if (
+        member.top_role >= interaction.user.top_role
+        and interaction.user.id != interaction.guild.owner_id
+    ):
+        await interaction.response.send_message(
+            "Your role must be higher than the target's role.", ephemeral=True
+        )
+        return
+    await member.ban(
+        reason=f"{reason} | Moderator: {interaction.user}",
+        delete_message_seconds=0,
+    )
+    await interaction.response.send_message(
+        f"**{member}** was banned. Reason: {reason}"
+    )
+    await send_log(
+        interaction.guild, "Member Banned",
+        f"**Target:** {member} (`{member.id}`)\n"
+        f"**Moderator:** {interaction.user}\n**Reason:** {reason}",
+    )
+
 
 @tree.command(name="timeout", description="Timeout a member for a set number of minutes")
-@app_commands.describe(member="Member to timeout", minutes="Duration in minutes", reason="Reason")
-async def timeout_cmd(interaction: discord.Interaction, member: discord.Member,
-                      minutes: app_commands.Range[int, 1, 40320], reason: str = "No reason provided"):
-    if not await require_access(interaction, "timeout"): return
-    if member.top_role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message("Your role must be higher than the target's role.", ephemeral=True); return
-    await member.timeout(timedelta(minutes=minutes), reason=f"{reason} | Moderator: {interaction.user}")
-    await interaction.response.send_message(f"**{member}** timed out for {minutes} minutes. Reason: {reason}")
-    await send_log(interaction.guild, "Member Timed Out", f"**Target:** {member}\n**Duration:** {minutes} minutes\n**Reason:** {reason}")
+@app_commands.describe(
+    member="Member to timeout", minutes="Duration in minutes", reason="Reason"
+)
+async def timeout_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str = "No reason provided",
+):
+    if not await require_access(interaction, "timeout"):
+        return
+    if (
+        member.top_role >= interaction.user.top_role
+        and interaction.user.id != interaction.guild.owner_id
+    ):
+        await interaction.response.send_message(
+            "Your role must be higher than the target's role.", ephemeral=True
+        )
+        return
+    await member.timeout(
+        timedelta(minutes=minutes),
+        reason=f"{reason} | Moderator: {interaction.user}",
+    )
+    await interaction.response.send_message(
+        f"**{member}** timed out for {minutes} minutes. Reason: {reason}"
+    )
+    await send_log(
+        interaction.guild, "Member Timed Out",
+        f"**Target:** {member}\n**Duration:** {minutes} minutes\n**Reason:** {reason}",
+    )
+
 
 @tree.command(name="warn", description="Warn a member and record the reason")
 async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
-    if not await require_access(interaction, "warn"): return
-    db_exec("INSERT INTO warns VALUES(?,?,?,?,?)",
-            (interaction.guild.id, member.id, interaction.user.id, reason, datetime.now(timezone.utc).isoformat()))
-    count = db_one("SELECT COUNT(*) AS n FROM warns WHERE guild_id=? AND user_id=?",
-                   (interaction.guild.id, member.id))["n"]
-    await interaction.response.send_message(f"{member.mention} has been warned. Total recorded warnings: **{count}**.")
-    await send_log(interaction.guild, "Member Warned", f"**Target:** {member}\n**Moderator:** {interaction.user}\n**Reason:** {reason}")
+    if not await require_access(interaction, "warn"):
+        return
+    db_exec(
+        "INSERT INTO warns VALUES(?,?,?,?,?)",
+        (
+            interaction.guild.id,
+            member.id,
+            interaction.user.id,
+            reason,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    count = db_one(
+        "SELECT COUNT(*) AS n FROM warns WHERE guild_id=? AND user_id=?",
+        (interaction.guild.id, member.id),
+    )["n"]
+    await interaction.response.send_message(
+        f"{member.mention} has been warned. Total recorded warnings: **{count}**."
+    )
+    await send_log(
+        interaction.guild, "Member Warned",
+        f"**Target:** {member}\n**Moderator:** {interaction.user}\n**Reason:** {reason}",
+    )
 
-@tree.command(name="purgeuser", description="Delete recent messages from one member in this channel")
-async def purgeuser(interaction: discord.Interaction, member: discord.Member,
-                    amount: app_commands.Range[int, 1, 100]):
-    if not await require_access(interaction, "purgeuser"): return
+
+@tree.command(
+    name="purgeuser",
+    description="Delete recent messages from one member in this channel",
+)
+async def purgeuser(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, 1, 100],
+):
+    if not await require_access(interaction, "purgeuser"):
+        return
     await interaction.response.defer(ephemeral=True)
     matches = []
     async for message in interaction.channel.history(limit=1000):
@@ -606,7 +841,10 @@ async def purgeuser(interaction: discord.Interaction, member: discord.Member,
             if len(matches) >= amount:
                 break
     if not matches:
-        await interaction.followup.send("No matching messages found in the recent channel history.", ephemeral=True)
+        await interaction.followup.send(
+            "No matching messages found in the recent channel history.",
+            ephemeral=True,
+        )
         return
     cutoff = discord.utils.utcnow() - timedelta(days=14)
     recent = [m for m in matches if m.created_at > cutoff]
@@ -623,27 +861,112 @@ async def purgeuser(interaction: discord.Interaction, member: discord.Member,
     for message in old:
         await message.delete()
         deleted_count += 1
-    await interaction.followup.send(f"Deleted {deleted_count} recent messages from {member.mention}.", ephemeral=True)
+    await interaction.followup.send(
+        f"Deleted {deleted_count} recent messages from {member.mention}.",
+        ephemeral=True,
+    )
+
 
 @tree.command(name="purgebot", description="Delete recent bot messages in this channel")
-async def purgebot(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
-    if not await require_access(interaction, "purgebot"): return
+async def purgebot(
+    interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]
+):
+    if not await require_access(interaction, "purgebot"):
+        return
     await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=amount, check=lambda m: m.author.bot, bulk=True)
-    await interaction.followup.send(f"Deleted {len(deleted)} bot messages.", ephemeral=True)
+    deleted = await interaction.channel.purge(
+        limit=amount, check=lambda m: m.author.bot, bulk=True
+    )
+    await interaction.followup.send(
+        f"Deleted {len(deleted)} bot messages.", ephemeral=True
+    )
+
 
 @tree.command(name="server_ban_list", description="Show the server's current ban list")
 async def server_ban_list(interaction: discord.Interaction):
-    if not await require_access(interaction, "ban"): return
+    if not await require_access(interaction, "ban"):
+        return
     bans = [entry async for entry in interaction.guild.bans(limit=100)]
     if not bans:
-        await interaction.response.send_message("The server ban list is empty.", ephemeral=True); return
-    lines = [f"{i+1}. {entry.user} (`{entry.user.id}`)" for i, entry in enumerate(bans[:50])]
-    await interaction.response.send_message("**Server Ban List**\n" + "\n".join(lines), ephemeral=True)
+        await interaction.response.send_message(
+            "The server ban list is empty.", ephemeral=True
+        )
+        return
+    lines = [
+        f"{i + 1}. {entry.user} (`{entry.user.id}`)"
+        for i, entry in enumerate(bans[:50])
+    ]
+    await interaction.response.send_message(
+        "**Server Ban List**\n" + "\n".join(lines), ephemeral=True
+    )
+
 
 # ------------------------------ SECURITY CONFIGURATION ------------------------------
 
 @tree.command(name="all_logs_channel", description="Set the server's log channel")
-async def all_logs_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not await require_access(interaction, "all_logs_channel"): return
-    ensure_guild(interaction.guild
+async def all_logs_channel(
+    interaction: discord.Interaction, channel: discord.TextChannel
+):
+    if not await require_access(interaction, "all_logs_channel"):
+        return
+    ensure_guild(interaction.guild.id)
+    db_exec(
+        "UPDATE guild_config SET log_channel_id=? WHERE guild_id=?",
+        (channel.id, interaction.guild.id),
+    )
+    await interaction.response.send_message(
+        f"All logs will be sent to {channel.mention}.", ephemeral=True
+    )
+
+
+@tree.command(name="advanced_logs", description="Turn advanced event logging on or off")
+@app_commands.choices(
+    state=[
+        app_commands.Choice(name="On", value="on"),
+        app_commands.Choice(name="Off", value="off"),
+    ]
+)
+async def advanced_logs(
+    interaction: discord.Interaction, state: app_commands.Choice[str]
+):
+    if not await require_access(interaction, "advanced_logs"):
+        return
+    db_exec(
+        "UPDATE guild_config SET advanced_logs=? WHERE guild_id=?",
+        (1 if state.value == "on" else 0, interaction.guild.id),
+    )
+    await interaction.response.send_message(
+        f"Advanced logs: **{state.value.upper()}**", ephemeral=True
+    )
+
+
+@tree.command(name="antinuke", description="Configure anti-nuke protection")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Timeout", value="timeout"),
+        app_commands.Choice(name="Kick", value="kick"),
+        app_commands.Choice(name="Ban", value="ban"),
+    ]
+)
+async def antinuke(
+    interaction: discord.Interaction,
+    enabled: bool,
+    action: app_commands.Choice[str] = None,
+    limit: app_commands.Range[int, 2, 10] = 3,
+    window_seconds: app_commands.Range[int, 5, 60] = 10,
+):
+    if not await require_access(interaction, "antinuke"):
+        return
+    db_exec(
+        """UPDATE guild_config SET antinuke_enabled=?, antinuke_action=?,
+           antinuke_limit=?, antinuke_window=? WHERE guild_id=?""",
+        (
+            int(enabled),
+            action.value if action else "timeout",
+            limit,
+            window_seconds,
+            interaction.guild.id,
+        ),
+    )
+    await interaction.response.send_message(
+        f"
