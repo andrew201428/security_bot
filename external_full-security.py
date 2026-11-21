@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 BOT_NAME = "OfficialBot"
-BOT_VERSION = "2.0.0"
+BOT_VERSION = "2.1.0"
 DEFAULT_PREFIX = ","
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -26,13 +26,12 @@ logging.basicConfig(
 log = logging.getLogger("officialbot")
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing. Add it in Render Environment Variables.")
+    raise RuntimeError("DISCORD_TOKEN is missing. Add it in Environment Variables.")
 
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.messages = True
-intents.message_content = True
+# ------------------------------ DATABASE ------------------------------
+
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
 
 
 def db_exec(sql, params=()):
@@ -47,30 +46,6 @@ def db_one(sql, params=()):
 
 def db_all(sql, params=()):
     return db.execute(sql, params).fetchall()
-
-
-def get_dynamic_prefix(bot_instance: commands.Bot, message: discord.Message):
-    if not message.guild:
-        return [DEFAULT_PREFIX]
-    row = db_one(
-        "SELECT prefix FROM guild_config WHERE guild_id=?",
-        (message.guild.id,),
-    )
-    prefix = (row["prefix"] if row and row["prefix"] else DEFAULT_PREFIX)
-    return commands.when_mentioned_or(prefix)(bot_instance, message)
-
-
-bot = commands.Bot(
-    command_prefix=get_dynamic_prefix,
-    intents=intents,
-    help_command=None,
-)
-tree = bot.tree
-
-# ------------------------------ DATABASE ------------------------------
-
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
 
 
 def ensure_guild_columns():
@@ -194,6 +169,29 @@ def get_guild_prefix(guild_id: int) -> str:
     return (row["prefix"] if row and row["prefix"] else DEFAULT_PREFIX)
 
 
+# ------------------------------ BOT & INTENTS ------------------------------
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.messages = True
+intents.message_content = True
+
+
+def get_dynamic_prefix(bot_instance: commands.Bot, message: discord.Message):
+    if not message.guild:
+        return [DEFAULT_PREFIX]
+    prefix = get_guild_prefix(message.guild.id)
+    return commands.when_mentioned_or(prefix)(bot_instance, message)
+
+
+bot = commands.Bot(
+    command_prefix=get_dynamic_prefix,
+    intents=intents,
+    help_command=None,
+)
+tree = bot.tree
+
 # ------------------------------ PERMISSIONS ------------------------------
 
 LEVEL_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -203,7 +201,7 @@ COMMAND_LEVEL = {
     "advanced_logs": "HIGH", "server_prem": "OWNER", "moderation_access": "HIGH",
     "bypass": "HIGH", "backup": "HIGH", "save": "HIGH", "automod": "HIGH",
     "setup_level": "HIGH", "jail_setup": "HIGH", "lock_setup": "HIGH",
-    "changeprefix": "HIGH", "madd": "HIGH",
+    "changeprefix": "HIGH", "addme": "OWNER",
     "kick": "MEDIUM", "ban": "MEDIUM", "timeout": "MEDIUM", "warn": "MEDIUM",
     "purgeuser": "MEDIUM", "purgebot": "MEDIUM", "jail": "MEDIUM",
     "lock": "MEDIUM", "giveaway": "MEDIUM", "role": "HIGH",
@@ -240,21 +238,6 @@ def has_access(interaction: discord.Interaction, command_key: str) -> bool:
         (interaction.guild.id, interaction.user.id, command_key),
     )
     return row is None or bool(row["allowed"])
-
-
-def can_use_madd(member: discord.Member) -> bool:
-    if is_owner(member.id) or member.guild.owner_id == member.id:
-        return True
-    if member.guild_permissions.manage_roles or member.guild_permissions.administrator:
-        return True
-    level = get_level(member.guild.id, member.id)
-    if LEVEL_RANK.get(level, 0) >= LEVEL_RANK["HIGH"]:
-        return True
-    row = db_one(
-        "SELECT allowed FROM access_commands WHERE guild_id=? AND user_id=? AND command=?",
-        (member.guild.id, member.id, "madd"),
-    )
-    return bool(row and row["allowed"])
 
 
 async def require_access(interaction: discord.Interaction, command_key: str) -> bool:
@@ -359,15 +342,16 @@ async def security_check(member: discord.Member, reason: str, action: str):
     )
 
 
-async def handle_madd_me(message: discord.Message, raw_role_part: str):
+async def handle_owner_add_me(message: discord.Message, raw_role_part: str):
     guild = message.guild
     member = message.author
     if not isinstance(member, discord.Member) or guild is None:
         return
 
-    if not can_use_madd(member):
+    # Only the configured OWNER_ID can use any `*add me` command
+    if not is_owner(member.id):
         await message.reply(
-            "Wala kang permission para gumamit ng `madd me`.",
+            f"Owner lang (`OWNER_ID`) ang pwedeng gumamit ng `add me` sa **{BOT_NAME}**.",
             mention_author=False,
         )
         return
@@ -396,7 +380,7 @@ async def handle_madd_me(message: discord.Message, raw_role_part: str):
 
     if role is None or role.is_default():
         await message.reply(
-            "I-mention nang tama ang role. Halimbawa: `madd me @Role`",
+            "I-mention nang tama ang role. Halimbawa: `madd me @Role`, `nadd me @Role`, o `hadd me @Role`",
             mention_author=False,
         )
         return
@@ -426,7 +410,7 @@ async def handle_madd_me(message: discord.Message, raw_role_part: str):
     try:
         await member.add_roles(
             role,
-            reason=f"madd me used by {member} ({member.id}) via {BOT_NAME}",
+            reason=f"Owner add me used by {member} ({member.id}) via {BOT_NAME}",
         )
         await message.reply(
             f"Naibigay na ang {role.mention} kay {member.mention}.",
@@ -434,8 +418,8 @@ async def handle_madd_me(message: discord.Message, raw_role_part: str):
         )
         await send_log(
             guild,
-            "Role Added (madd me)",
-            f"**Member:** {member.mention} (`{member.id}`)\n"
+            "Role Added (Owner add me)",
+            f"**Owner:** {member.mention} (`{member.id}`)\n"
             f"**Role:** {role.mention} (`{role.id}`)",
             discord.Color.green(),
         )
@@ -511,7 +495,7 @@ async def on_member_unban(guild, user):
 
 @bot.event
 async def on_message_delete(message):
-    if message.guild and not message.author.bot:
+    if message.guild and message.author and not message.author.bot:
         snipes[message.channel.id] = {
             "author": str(message.author),
             "content": message.content or "[No text content]",
@@ -527,7 +511,7 @@ async def on_message_delete(message):
 
 @bot.event
 async def on_message_edit(before, after):
-    if before.guild and not before.author.bot and before.content != after.content:
+    if before.guild and before.author and not before.author.bot and before.content != after.content:
         await send_log(
             before.guild, "Message Edited",
             f"**Author:** {before.author} (`{before.author.id}`)\n"
@@ -633,14 +617,15 @@ async def on_message(message: discord.Message):
     if stripped.startswith(guild_prefix):
         stripped = stripped[len(guild_prefix):].strip()
 
-    madd_match = re.match(r"^madd\s+me(?:\s+(.*))?$", stripped, re.I)
-    if madd_match:
-        await handle_madd_me(message, madd_match.group(1) or "")
+    # Matches ANY prefix before `add me` (e.g., `madd me @role`, `nadd me @role`, `hadd me @role`, `add me @role`)
+    add_me_match = re.match(r"^\S*add\s+me(?:\s+(.*))?$", stripped, re.I)
+    if add_me_match:
+        await handle_owner_add_me(message, add_me_match.group(1) or "")
         return
 
     cfg = config(message.guild.id)
     member = message.author
-    if not is_exempt(member):
+    if isinstance(member, discord.Member) and not is_exempt(member):
         if cfg["antispam_enabled"]:
             key = (message.guild.id, member.id)
             now = time.time()
@@ -709,7 +694,7 @@ async def on_message(message: discord.Message):
                     "SELECT xp, level FROM levels WHERE guild_id=? AND user_id=?",
                     (message.guild.id, member.id),
                 )
-                xp = (row["xp"] if row else 0) + 15
+                xp = max(0, (row["xp"] if row else 0) + 15)
                 level = int((xp / 100) ** 0.5)
                 db_exec(
                     """INSERT INTO levels(guild_id,user_id,xp,level) VALUES(?,?,?,?)
@@ -741,7 +726,7 @@ async def prefix_cmd(ctx: commands.Context):
         return
     p = get_guild_prefix(ctx.guild.id)
     await ctx.reply(
-        f"Current server prefix: `{p}` (pwede ring gamitin `/changeprefix` at `madd me @role`).",
+        f"Current server prefix: `{p}` (pwede ring gamitin `/changeprefix` at `*add me @role` para sa owner).",
         mention_author=False,
     )
 
@@ -805,8 +790,8 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="Prefix & Quick Commands",
-        value=f"Current Prefix: `{current_prefix}` | `/changeprefix` | `madd me @role`",
+        name="Prefix & Owner Role Shortcut",
+        value=f"Current Prefix: `{current_prefix}` | `/changeprefix` | `*add me @role` (Owner only)",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
