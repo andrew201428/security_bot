@@ -16,7 +16,7 @@ BOT_VERSION = "2.0.0"
 DEFAULT_PREFIX = ","
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-DB_PATH = os.getenv("OFFCIALBOT_DB", "officialbot.db")
+DB_PATH = os.getenv("OFFICIALBOT_DB", os.getenv("ASIANTRXPZ_DB", "officialbot.db"))
 OWNER_ID = int(os.getenv("OWNER_ID", "1460495693536825479"))
 
 logging.basicConfig(
@@ -26,13 +26,27 @@ logging.basicConfig(
 log = logging.getLogger("officialbot")
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing. Add it in Environment Variables.")
+    raise RuntimeError("DISCORD_TOKEN is missing. Add it in Render Environment Variables.")
 
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.messages = True
 intents.message_content = True
+
+
+def db_exec(sql, params=()):
+    cur = db.execute(sql, params)
+    db.commit()
+    return cur
+
+
+def db_one(sql, params=()):
+    return db.execute(sql, params).fetchone()
+
+
+def db_all(sql, params=()):
+    return db.execute(sql, params).fetchall()
 
 
 def get_dynamic_prefix(bot_instance: commands.Bot, message: discord.Message):
@@ -57,20 +71,6 @@ tree = bot.tree
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
-
-
-def db_exec(sql, params=()):
-    cur = db.execute(sql, params)
-    db.commit()
-    return cur
-
-
-def db_one(sql, params=()):
-    return db.execute(sql, params).fetchone()
-
-
-def db_all(sql, params=()):
-    return db.execute(sql, params).fetchall()
 
 
 def ensure_guild_columns():
@@ -408,7 +408,7 @@ async def handle_madd_me(message: discord.Message, raw_role_part: str):
         )
         return
 
-    # Intentionally checks ONLY the bot's top role vs target role (not user's role hierarchy)
+    # Checks ONLY the bot's top role vs target role (not user's role hierarchy)
     if me.top_role.position <= role.position:
         await message.reply(
             f"Mas mataas o kapantay ang {role.mention} sa top role ng **{BOT_NAME}** ({me.top_role.mention}). Itaas mo muna ang role ng bot.",
@@ -628,7 +628,6 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # Support `madd me @role` (with or without server prefix)
     guild_prefix = get_guild_prefix(message.guild.id)
     stripped = message.content.strip()
     if stripped.startswith(guild_prefix):
@@ -847,4 +846,609 @@ async def userinfo(interaction: discord.Interaction, member: discord.Member = No
 async def serverinfo(interaction: discord.Interaction):
     if not await require_guild(interaction):
         return
-    if not await require_access(interaction, "server
+    if not await require_access(interaction, "serverinfo"):
+        return
+    await interaction.response.defer()
+    g = interaction.guild
+    embed = discord.Embed(
+        title=f"Server Information — {g.name}", color=discord.Color.blurple()
+    )
+    if g.icon:
+        embed.set_thumbnail(url=g.icon.url)
+    embed.add_field(name="Server ID", value=str(g.id), inline=True)
+    embed.add_field(name="Owner", value=f"<@{g.owner_id}>", inline=True)
+    embed.add_field(name="Members", value=str(g.member_count), inline=True)
+    embed.add_field(name="Roles", value=str(len(g.roles)), inline=True)
+    embed.add_field(name="Channels", value=str(len(g.channels)), inline=True)
+    embed.add_field(
+        name="Created",
+        value=discord.utils.format_dt(g.created_at, "D"),
+        inline=True,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="avatar", description="Show a member's avatar")
+async def avatar(interaction: discord.Interaction, member: discord.Member = None):
+    if not await require_access(interaction, "avatar"):
+        return
+    await interaction.response.defer()
+    member = member or interaction.user
+    embed = discord.Embed(
+        title=f"{member}'s Avatar", color=discord.Color.blurple()
+    )
+    embed.set_image(url=member.display_avatar.url)
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="banner", description="Show a member's profile banner")
+async def banner(interaction: discord.Interaction, user: discord.User = None):
+    if not await require_access(interaction, "banner"):
+        return
+    await interaction.response.defer()
+    user = user or interaction.user
+    try:
+        user = await bot.fetch_user(user.id)
+    except discord.HTTPException:
+        await interaction.followup.send("Could not fetch that user.", ephemeral=True)
+        return
+    if not user.banner:
+        await interaction.followup.send(
+            "This user has no public banner.", ephemeral=True
+        )
+        return
+    embed = discord.Embed(
+        title=f"{user}'s Banner", color=discord.Color.blurple()
+    )
+    embed.set_image(url=user.banner.url)
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="kick", description="Kick a member from this server")
+@app_commands.describe(member="Member to kick", reason="Reason for the kick")
+async def kick(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+):
+    if not await require_access(interaction, "kick"):
+        return
+    await interaction.response.defer()
+    if member.id == interaction.user.id or member.guild_permissions.administrator:
+        await interaction.followup.send(
+            "That member cannot be kicked with this command.", ephemeral=True
+        )
+        return
+    if (
+        member.top_role >= interaction.user.top_role
+        and interaction.user.id != interaction.guild.owner_id
+    ):
+        await interaction.followup.send(
+            "Your role must be higher than the target's role.", ephemeral=True
+        )
+        return
+    try:
+        await member.kick(reason=f"{reason} | Moderator: {interaction.user}")
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to kick that member.", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
+        f"**{member}** was kicked. Reason: {reason}"
+    )
+    await send_log(
+        interaction.guild, "Member Kicked",
+        f"**Target:** {member} (`{member.id}`)\n"
+        f"**Moderator:** {interaction.user}\n**Reason:** {reason}",
+    )
+
+
+@tree.command(name="ban", description="Ban a member from this server")
+@app_commands.describe(member="Member to ban", reason="Reason for the ban")
+async def ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+):
+    if not await require_access(interaction, "ban"):
+        return
+    await interaction.response.defer()
+    if member.id == interaction.user.id or member.guild_permissions.administrator:
+        await interaction.followup.send(
+            "That member cannot be banned with this command.", ephemeral=True
+        )
+        return
+    if (
+        member.top_role >= interaction.user.top_role
+        and interaction.user.id != interaction.guild.owner_id
+    ):
+        await interaction.followup.send(
+            "Your role must be higher than the target's role.", ephemeral=True
+        )
+        return
+    try:
+        await member.ban(
+            reason=f"{reason} | Moderator: {interaction.user}",
+            delete_message_seconds=0,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to ban that member.", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
+        f"**{member}** was banned. Reason: {reason}"
+    )
+    await send_log(
+        interaction.guild, "Member Banned",
+        f"**Target:** {member} (`{member.id}`)\n"
+        f"**Moderator:** {interaction.user}\n**Reason:** {reason}",
+    )
+
+
+@tree.command(name="timeout", description="Timeout a member for a set number of minutes")
+@app_commands.describe(
+    member="Member to timeout", minutes="Duration in minutes", reason="Reason"
+)
+async def timeout_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str = "No reason provided",
+):
+    if not await require_access(interaction, "timeout"):
+        return
+    await interaction.response.defer()
+    if (
+        member.top_role >= interaction.user.top_role
+        and interaction.user.id != interaction.guild.owner_id
+    ):
+        await interaction.followup.send(
+            "Your role must be higher than the target's role.", ephemeral=True
+        )
+        return
+    try:
+        await member.timeout(
+            timedelta(minutes=minutes),
+            reason=f"{reason} | Moderator: {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to timeout that member.", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
+        f"**{member}** timed out for {minutes} minutes. Reason: {reason}"
+    )
+    await send_log(
+        interaction.guild, "Member Timed Out",
+        f"**Target:** {member}\n**Duration:** {minutes} minutes\n**Reason:** {reason}",
+    )
+
+
+@tree.command(name="warn", description="Warn a member and record the reason")
+async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
+    if not await require_access(interaction, "warn"):
+        return
+    await interaction.response.defer()
+    db_exec(
+        "INSERT INTO warns VALUES(?,?,?,?,?)",
+        (
+            interaction.guild.id,
+            member.id,
+            interaction.user.id,
+            reason,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    count = db_one(
+        "SELECT COUNT(*) AS n FROM warns WHERE guild_id=? AND user_id=?",
+        (interaction.guild.id, member.id),
+    )["n"]
+    await interaction.followup.send(
+        f"{member.mention} has been warned. Total recorded warnings: **{count}**."
+    )
+    await send_log(
+        interaction.guild, "Member Warned",
+        f"**Target:** {member}\n**Moderator:** {interaction.user}\n**Reason:** {reason}",
+    )
+
+
+@tree.command(
+    name="purgeuser",
+    description="Delete recent messages from one member in this channel",
+)
+async def purgeuser(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, 1, 100],
+):
+    if not await require_access(interaction, "purgeuser"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    matches = []
+    async for message in interaction.channel.history(limit=1000):
+        if message.author.id == member.id:
+            matches.append(message)
+            if len(matches) >= amount:
+                break
+    if not matches:
+        await interaction.followup.send(
+            "No matching messages found in the recent channel history.",
+            ephemeral=True,
+        )
+        return
+    cutoff = discord.utils.utcnow() - timedelta(days=14)
+    recent = [m for m in matches if m.created_at > cutoff]
+    old = [m for m in matches if m.created_at <= cutoff]
+    deleted_count = 0
+    for start in range(0, len(recent), 100):
+        batch = recent[start:start + 100]
+        if len(batch) == 1:
+            await batch[0].delete()
+            deleted_count += 1
+        elif batch:
+            removed = await interaction.channel.delete_messages(batch)
+            deleted_count += len(removed)
+    for message in old:
+        await message.delete()
+        deleted_count += 1
+    await interaction.followup.send(
+        f"Deleted {deleted_count} recent messages from {member.mention}.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="purgebot", description="Delete recent bot messages in this channel")
+async def purgebot(
+    interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]
+):
+    if not await require_access(interaction, "purgebot"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(
+        limit=amount, check=lambda m: m.author.bot, bulk=True
+    )
+    await interaction.followup.send(
+        f"Deleted {len(deleted)} bot messages.", ephemeral=True
+    )
+
+
+@tree.command(name="server_ban_list", description="Show the server's current ban list")
+async def server_ban_list(interaction: discord.Interaction):
+    if not await require_access(interaction, "ban"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    bans = [entry async for entry in interaction.guild.bans(limit=100)]
+    if not bans:
+        await interaction.followup.send(
+            "The server ban list is empty.", ephemeral=True
+        )
+        return
+    lines = [
+        f"{i + 1}. {entry.user} (`{entry.user.id}`)"
+        for i, entry in enumerate(bans[:50])
+    ]
+    await interaction.followup.send(
+        "**Server Ban List**\n" + "\n".join(lines), ephemeral=True
+    )
+
+
+@tree.command(name="all_logs_channel", description="Set the server's log channel")
+async def all_logs_channel(
+    interaction: discord.Interaction, channel: discord.TextChannel
+):
+    if not await require_access(interaction, "all_logs_channel"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    ensure_guild(interaction.guild.id)
+    db_exec(
+        "UPDATE guild_config SET log_channel_id=? WHERE guild_id=?",
+        (channel.id, interaction.guild.id),
+    )
+    await interaction.followup.send(
+        f"All logs will be sent to {channel.mention}.", ephemeral=True
+    )
+
+
+@tree.command(name="advanced_logs", description="Turn advanced event logging on or off")
+@app_commands.choices(
+    state=[
+        app_commands.Choice(name="On", value="on"),
+        app_commands.Choice(name="Off", value="off"),
+    ]
+)
+async def advanced_logs(
+    interaction: discord.Interaction, state: app_commands.Choice[str]
+):
+    if not await require_access(interaction, "advanced_logs"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    db_exec(
+        "UPDATE guild_config SET advanced_logs=? WHERE guild_id=?",
+        (1 if state.value == "on" else 0, interaction.guild.id),
+    )
+    await interaction.followup.send(
+        f"Advanced logs: **{state.value.upper()}**", ephemeral=True
+    )
+
+
+@tree.command(name="antinuke", description="Configure anti-nuke protection")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Timeout", value="timeout"),
+        app_commands.Choice(name="Kick", value="kick"),
+        app_commands.Choice(name="Ban", value="ban"),
+    ]
+)
+async def antinuke(
+    interaction: discord.Interaction,
+    enabled: bool,
+    action: app_commands.Choice[str] = None,
+    limit: app_commands.Range[int, 2, 10] = 3,
+    window_seconds: app_commands.Range[int, 5, 60] = 10,
+):
+    if not await require_access(interaction, "antinuke"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    db_exec(
+        """UPDATE guild_config SET antinuke_enabled=?, antinuke_action=?,
+           antinuke_limit=?, antinuke_window=? WHERE guild_id=?""",
+        (
+            int(enabled),
+            action.value if action else "timeout",
+            limit,
+            window_seconds,
+            interaction.guild.id,
+        ),
+    )
+    await interaction.followup.send(
+        f"Anti-nuke **{'enabled' if enabled else 'disabled'}**. "
+        f"Threshold: {limit} actions / {window_seconds}s. "
+        f"Punishment: {(action.value if action else 'timeout').upper()}.",
+        ephemeral=True,
+    )
+
+
+@tree.command(
+    name="antinuke_whitelist",
+    description="Add or remove a member or bot from anti-nuke whitelist",
+)
+@app_commands.choices(
+    operation=[
+        app_commands.Choice(name="Add", value="add"),
+        app_commands.Choice(name="Remove", value="remove"),
+        app_commands.Choice(name="List", value="list"),
+    ]
+)
+async def antinuke_whitelist(
+    interaction: discord.Interaction,
+    operation: app_commands.Choice[str],
+    user: discord.User = None,
+):
+    if not await require_access(interaction, "antinuke"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    gid = interaction.guild.id
+    if operation.value == "list":
+        rows = db_all(
+            "SELECT target_id,target_type FROM antinuke_whitelist WHERE guild_id=?",
+            (gid,),
+        )
+        text = "\n".join(
+            f"<@{r['target_id']}> — {r['target_type']}" for r in rows
+        ) or "Whitelist is empty."
+        await interaction.followup.send(text, ephemeral=True)
+        return
+    if user is None:
+        await interaction.followup.send(
+            "Select a user or bot.", ephemeral=True
+        )
+        return
+    if operation.value == "add":
+        db_exec(
+            "INSERT OR IGNORE INTO antinuke_whitelist VALUES(?,?,?)",
+            (gid, user.id, "bot" if user.bot else "member"),
+        )
+    else:
+        db_exec(
+            "DELETE FROM antinuke_whitelist WHERE guild_id=? AND target_id=?",
+            (gid, user.id),
+        )
+    await interaction.followup.send(
+        f"Anti-nuke whitelist updated for {user.mention}.", ephemeral=True
+    )
+
+
+@tree.command(name="antispam", description="Configure anti-spam protection")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Timeout", value="timeout"),
+        app_commands.Choice(name="Kick", value="kick"),
+        app_commands.Choice(name="Ban", value="ban"),
+    ]
+)
+async def antispam(
+    interaction: discord.Interaction,
+    enabled: bool,
+    action: app_commands.Choice[str] = None,
+    limit: app_commands.Range[int, 3, 20] = 5,
+    window_seconds: app_commands.Range[int, 2, 30] = 5,
+):
+    if not await require_access(interaction, "antispam"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    db_exec(
+        """UPDATE guild_config SET antispam_enabled=?, antispam_action=?,
+           antispam_limit=?, antispam_window=? WHERE guild_id=?""",
+        (
+            int(enabled),
+            action.value if action else "timeout",
+            limit,
+            window_seconds,
+            interaction.guild.id,
+        ),
+    )
+    await interaction.followup.send(
+        "Anti-spam configuration saved.", ephemeral=True
+    )
+
+
+@tree.command(name="anti_link", description="Configure link filtering")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Delete only", value="delete"),
+        app_commands.Choice(name="Timeout", value="timeout"),
+        app_commands.Choice(name="Kick", value="kick"),
+        app_commands.Choice(name="Ban", value="ban"),
+    ]
+)
+async def anti_link(
+    interaction: discord.Interaction,
+    enabled: bool,
+    action: app_commands.Choice[str] = None,
+):
+    if not await require_access(interaction, "anti_link"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    db_exec(
+        "UPDATE guild_config SET antilink_enabled=?, antilink_action=? WHERE guild_id=?",
+        (int(enabled), action.value if action else "delete", interaction.guild.id),
+    )
+    await interaction.followup.send(
+        "Anti-link configuration saved.", ephemeral=True
+    )
+
+
+@tree.command(name="anti_mention", description="Configure mass-mention protection")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Timeout", value="timeout"),
+        app_commands.Choice(name="Kick", value="kick"),
+        app_commands.Choice(name="Ban", value="ban"),
+    ]
+)
+async def anti_mention(
+    interaction: discord.Interaction,
+    enabled: bool,
+    action: app_commands.Choice[str] = None,
+    limit: app_commands.Range[int, 2, 20] = 5,
+):
+    if not await require_access(interaction, "anti_mention"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    db_exec(
+        "UPDATE guild_config SET antimention_enabled=?, antimention_action=?, antimention_limit=? WHERE guild_id=?",
+        (
+            int(enabled),
+            action.value if action else "timeout",
+            limit,
+            interaction.guild.id,
+        ),
+    )
+    await interaction.followup.send(
+        "Anti-mention configuration saved.", ephemeral=True
+    )
+
+
+@tree.command(name="anti_nsfw", description="Configure basic NSFW text filtering")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Delete only", value="delete"),
+        app_commands.Choice(name="Timeout", value="timeout"),
+        app_commands.Choice(name="Kick", value="kick"),
+        app_commands.Choice(name="Ban", value="ban"),
+    ]
+)
+async def anti_nsfw(
+    interaction: discord.Interaction,
+    enabled: bool,
+    action: app_commands.Choice[str] = None,
+):
+    if not await require_access(interaction, "anti_nsfw"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    db_exec(
+        "UPDATE guild_config SET antinsfw_enabled=?, antinsfw_action=? WHERE guild_id=?",
+        (int(enabled), action.value if action else "delete", interaction.guild.id),
+    )
+    await interaction.followup.send(
+        "Anti-NSFW text filter configuration saved. Note: this is a basic "
+        "text-pattern filter, not image/video detection.",
+        ephemeral=True,
+    )
+
+
+@tree.command(
+    name="moderation_access",
+    description="Manage a staff member's HIGH/MEDIUM/LOW access",
+)
+@app_commands.choices(
+    operation=[
+        app_commands.Choice(name="Add", value="add"),
+        app_commands.Choice(name="Remove", value="remove"),
+        app_commands.Choice(name="List", value="list"),
+        app_commands.Choice(name="Edit level", value="edit"),
+    ],
+    level=[
+        app_commands.Choice(name="LOW", value="LOW"),
+        app_commands.Choice(name="MEDIUM", value="MEDIUM"),
+        app_commands.Choice(name="HIGH", value="HIGH"),
+    ],
+)
+async def moderation_access(
+    interaction: discord.Interaction,
+    operation: app_commands.Choice[str],
+    member: discord.Member = None,
+    level: app_commands.Choice[str] = None,
+):
+    if not await require_access(interaction, "moderation_access"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    gid = interaction.guild.id
+    if operation.value == "list":
+        rows = db_all(
+            "SELECT user_id,level FROM access_levels WHERE guild_id=? ORDER BY level",
+            (gid,),
+        )
+        body = (
+            "\n".join(f"<@{r['user_id']}> — **{r['level']}**" for r in rows)
+            or "No staff entries."
+        )
+        await interaction.followup.send(body, ephemeral=True)
+        return
+    if member is None:
+        await interaction.followup.send("Select a member.", ephemeral=True)
+        return
+    if member.id == interaction.guild.owner_id or is_owner(member.id):
+        await interaction.followup.send(
+            "Server owner or bot owner already has full access.", ephemeral=True
+        )
+        return
+    if operation.value == "remove":
+        db_exec(
+            "DELETE FROM access_levels WHERE guild_id=? AND user_id=?",
+            (gid, member.id),
+        )
+        await interaction.followup.send(
+            f"Removed access level for {member.mention}.", ephemeral=True
+        )
+        return
+    if level is None:
+        await interaction.followup.send(
+            "Choose a level (`LOW`, `MEDIUM`, or `HIGH`).", ephemeral=True
+        )
+        return
+    db_exec(
+        """INSERT INTO access_levels(guild_id,user_id,level) VALUES(?,?,?)
+           ON CONFLICT(guild_id,user_id) DO UPDATE SET level=excluded.level""",
+        (gid, member.id, level.value),
+    )
+    await interaction.followup.send(
+        f"Set {member.mention} access level to **{level.value}**.", ephemeral=True
+    )
+
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
